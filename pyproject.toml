@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pm7-rs-python"
+version = "0.1.2"
+description = "PM7 semiempirical NDDO method (pm7-rs) with Python-native and ASE APIs"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.9"
+authors = [{ name = "ss0832" }]
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+ase = ["ase>=3.22"]
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "pm7_rs._native"

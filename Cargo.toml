@@ -1,0 +1,51 @@
+[package]
+name = "pm7-rs"
+version = "0.1.2"
+edition = "2021"
+rust-version = "1.82"
+license = "GPL-3.0-or-later"
+authors = ["ss0832"]
+description = "Rust-native PM7 semiempirical NDDO method with MOPAC-derived parameter tables and Rust, Python-native, and ASE APIs."
+readme = "README.md"
+documentation = "https://docs.rs/pm7-rs"
+keywords = ["chemistry", "quantum-chemistry", "semiempirical", "pm7", "mopac"]
+categories = ["science", "simulation"]
+autobins = false
+# Keep the published crate lean: the embedded parameter CSVs (src/data/*.csv) are all that is
+# needed at runtime. The local MOPAC reference checkout, the oracle binary + validation outputs,
+# the reference archive, and locally-built Python extension artifacts are development-only.
+exclude = [
+    ".mopac-source/",
+    "tools/oracle/",
+    "*.zip",
+    "am1-rs-proto-*.md",
+    "**/__pycache__/",
+    "**/*.pyc",
+    "**/*.pyd",
+]
+
+[lib]
+name = "pm7_rs"
+path = "src/lib.rs"
+# `rlib` for native builds/tests/CLI; `cdylib` for the maturin-built Python extension.
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "pm7_rs_cli"
+path = "src/bin/pm7_rs.rs"
+
+[profile.release]
+# Shipping builds prioritize runtime throughput: whole-program Fat LTO and one codegen unit.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+
+[dependencies]
+faer = { version = "0.24", default-features = false, features = ["std", "linalg", "rayon"] }
+rayon = "1.10"
+pyo3 = { version = "0.23.5", optional = true, features = ["extension-module", "abi3-py39"] }
+
+[features]
+default = []
+python = ["pyo3"]
