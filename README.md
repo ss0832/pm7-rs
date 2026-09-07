@@ -1,9 +1,10 @@
 # pm7-rs
 
 `pm7-rs` is a Rust implementation of the PM7 semiempirical NDDO method and its PM7-TS,
-PM7-minus, PM7-HH, and Sparkle/PM7 methods. It provides RHF/UHF energies, heats of formation,
-Mulliken charges, gradients, Hessians, geometry optimization, harmonic frequencies, a CLI, and
-Python/ASE interfaces.
+PM7-minus, PM7-HH, and Sparkle/PM7 methods, for **molecules and for periodic systems in one, two
+and three dimensions**. It provides RHF/UHF energies, heats of formation, Mulliken charges,
+analytic gradients, analytic stress, Hessians, phonons, geometry optimization, harmonic
+frequencies, a linear-scaling divide-and-conquer SCF, a CLI, and Python/ASE interfaces.
 
 The parameter tables are generated from a pinned MOPAC v23.2.5 source tree. The implementation
 uses `faer` for dense eigensolvers and `rayon` for deterministic pair- and coordinate-level
@@ -12,11 +13,42 @@ parallelism. The project is GPL-3.0-or-later.
 ## Status and physical scope
 
 - Full minimal-valence s/p/d MNDO/d kernel for supported PM7 elements.
-- PM7 dispersion, EH+ hydrogen-bond correction, and PM7-HH H-H correction.
+- PM7 dispersion, EH+ hydrogen-bond correction, and PM7-HH H-H correction — all periodic.
 - RHF and UHF with explicit `ScfReference::{Auto, Restricted, Unrestricted}` control.
 - Forward-mode AD gradients and AD/CPHF Hessians for RHF and UHF.
+- **SCF stability analysis** (Seeger–Pople), on the same orbital Hessian the CPHF already applies:
+  is the converged solution a minimum, or only a stationary point? Singlet and triplet channels,
+  and — opt-in — an escape along the unstable direction that keeps whichever solution is lower.
+  It removes the classic RHF dissociation failure: stretched H₂ goes from 121.6 kcal/mol above
+  two hydrogen atoms to within 0.02 of them. `⟨S²⟩` is reported for every unrestricted solution.
+  **Off by default.**
 - Sparkle/PM7 lanthanide sites and PM7-family parameter selection.
-- Molecular, non-periodic calculations only.
+- **Periodic boundary conditions** in 1-D, 2-D and 3-D: Gamma point and Monkhorst-Pack k meshes,
+  neutral and charged cells, energy, analytic gradient, analytic stress, analytic zone-centre
+  force constants. See [`docs/pbc.md`](docs/pbc.md).
+- **Phonons and perturbation theory at arbitrary wavevector** (an NDDO density-functional
+  perturbation theory coupling `k` with `k + q`), for restricted, unrestricted and smeared metallic
+  cells, plus band structures along a k path.
+- **Molecular properties**: a uniform external electric field with an exact analytic gradient and
+  Hessian, a corrected dipole with its terms reported separately, orbital energies and
+  coefficients, IR spectra, and Molden output. See [`docs/properties.md`](docs/properties.md).
+- **Born effective charges, the polarizability, both dielectric tensors and LO–TO splitting**, from
+  the same perturbation solver with a homogeneous field taken through the commutator `[H, r]`. The
+  electronic `eps^inf` in 3-D and, with an assigned extent, for a chain or a slab; the static
+  `eps^0` with the ionic term added.
+- **Berry-phase polarization and a finite field along a lattice vector** (the Nunes-Gonze electric
+  enthalpy), which exist as independent checks on the perturbative field response: the finite-field
+  polarizability agrees with the CPHF one to a ratio of 1.0063 on two formalisms sharing only the
+  SCF.
+- **Divide and conquer**: a linear-scaling SCF with gradient and stress, measured log-log slope
+  0.99 above 200 atoms. See [`docs/divide_and_conquer.md`](docs/divide_and_conquer.md).
+
+Two limits worth knowing before you start: sampling a small cell at the Gamma point alone gets
+the exchange **quantitatively wrong**, not merely coarse (29 eV/atom for a two-atom diamond
+cell), so use a k mesh; and the EH+ hydrogen-bond gradient diverges when the acceptor's dihedral
+axis goes collinear, which is a defect in PM7's published functional form rather than in this
+implementation. Both are measured in [`docs/scope.md`](docs/scope.md) and
+[`docs/singularities.md`](docs/singularities.md).
 
 PM7 is an empirical semiempirical model; agreement with a MOPAC implementation does not imply
 ab-initio accuracy outside the model's parameterization domain. Hydrogen-bond topology is
@@ -73,8 +105,49 @@ field documents another unit.
 cargo run --release --bin pm7_rs_cli -- energy examples/water.xyz --json
 cargo run --release --bin pm7_rs_cli -- gradient examples/methane.xyz
 cargo run --release --bin pm7_rs_cli -- energy examples/methyl.xyz --multiplicity 2
-cargo run --release --bin pm7_rs_cli -- frequencies examples/water.xyz
+cargo run --release --bin pm7_rs_cli -- frequencies examples/water.xyz --ir
+cargo run --release --bin pm7_rs_cli -- forces examples/methane.xyz
+cargo run --release --bin pm7_rs_cli -- hessian examples/water.xyz
+cargo run --release --bin pm7_rs_cli -- molden examples/water.xyz -o water.molden
+cargo run --release --bin pm7_rs_cli -- energy examples/water.xyz --field 0.5,0,0
 ```
+
+Periodic modes take the cell from an extended-XYZ `Lattice="..."` key — which is what
+`atoms.write()` produces in ASE — or from `--cell`:
+
+```powershell
+cargo run --release --bin pm7_rs_cli -- energy diamond.xyz --kpoints 4 4 4
+cargo run --release --bin pm7_rs_cli -- stress diamond.xyz --kpoints 4 4 4
+cargo run --release --bin pm7_rs_cli -- phonons diamond.xyz --supercell 2 2 2 --qpoints 0,0,0 0.5,0,0
+cargo run --release --bin pm7_rs_cli -- dfpt diamond.xyz --kpoints 4 4 4 --qpoints 0.3,-0.15,0.42
+cargo run --release --bin pm7_rs_cli -- born diamond.xyz --kpoints 4 4 4 --lo-to 1,0,0
+cargo run --release --bin pm7_rs_cli -- bands diamond.xyz --kpoints 4 4 4 --qpoints 0,0,0 0.5,0,0
+cargo run --release --bin pm7_rs_cli -- dielectric bn_sheet.xyz --slab-thickness 3.33 --kpoints 4 4 1
+cargo run --release --bin pm7_rs_cli -- energy chain.xyz --cell 3.2,0,0
+cargo run --release --bin pm7_rs_cli -- energy slab.xyz --cell 3.2,0,0,0,0,12,0,3.2,0 --pbc TFT
+cargo run --release --bin pm7_rs_cli -- optimize diamond.xyz --kpoints 2 2 2 --opt-cell
+cargo run --release --bin pm7_rs_cli -- energy big.xyz --dandc 15.0
+```
+
+`--opt-cell` relaxes the lattice as well as the atoms, driven by the analytic stress. Without it a
+periodic `optimize` reports success with whatever stress the fixed cell implies — diamond at
+`a = 3.75 Å` comes back converged after one iteration with −29.6 GPa standing.
+
+`--pbc` takes any per-axis pattern; the lattice vectors are reordered so the periodic ones lead,
+and `--kpoints`, `--supercell` and fractional `--qpoints` move with them.
+
+`--stability check|follow` asks whether the converged SCF is a minimum rather than merely a
+stationary point, and — with `follow` — escapes it. Off by default:
+
+```powershell
+cargo run --release --bin pm7_rs_cli -- energy h2_stretched.xyz                      # 225.79 kcal/mol
+cargo run --release --bin pm7_rs_cli -- energy h2_stretched.xyz --stability follow   # 104.19, two H atoms
+```
+
+`pm7_rs_cli` with no arguments prints every mode and flag. Both command lines offer the same fifteen
+modes — `energy`, `charges`, `gradient`, `forces`, `stress`, `optimize`, `frequencies`, `hessian`,
+`phonons`, `dfpt`, `born`, `bands`, `orbitals`, `molden`, `dielectric` — and the same flags, both
+enumerated by tests to keep it that way.
 
 ## Python and ASE
 
@@ -85,6 +158,17 @@ python -m pip install maturin
 maturin develop --release --features python
 ```
 
+Installing from PyPI also puts a **`pm7-rs`** command on your path, covering every mode the Rust
+binary does (the Rust binary is not shipped inside the wheel):
+
+```bash
+pip install pm7-rs-python
+pm7-rs energy water.xyz --json
+pm7-rs phonons diamond.xyz --supercell 2 2 2 --qpoints 0,0,0 0.5,0,0
+```
+
+`python -m pm7_rs` is the same entry point, and works even when the scripts directory is not on
+`PATH`.
 The native Python API accepts Angstrom coordinates and exposes both atomic-unit and eV/Angstrom
 results:
 
@@ -137,7 +221,9 @@ are never cut, and `None` is the exact default.
 
 ## MOPAC validation
 
-Fixed-geometry v0.1.2 results compared with the official MOPAC v23.2.5 executable:
+Fixed-geometry results compared with the official MOPAC v23.2.5 executable. The oracle scripts in
+`tools/oracle/` regenerate these against a real MOPAC install and currently report a difference of
+`0.0000` kcal/mol on every molecule they cover:
 
 | System | pm7-rs (kcal/mol) | MOPAC (kcal/mol) |
 |---|---:|---:|
@@ -149,6 +235,13 @@ Fixed-geometry v0.1.2 results compared with the official MOPAC v23.2.5 executabl
 The regression suite also covers PM7 methods, d-shell species, Sparkle/PM7 fluorides,
 hydrogen-bond corrections, SCF-basin selection, all supported element pairs, and gradient/Hessian
 finite-difference checks.
+
+`tools/oracle/baseline.py` carries **176** cases covering **all 73 elements PM7 is parameterized
+for** — a contract enforced by reading `src/data/pm7_elements.csv`, not a comment — across five
+multiplicities, charges −2 to +2 and sixteen organometallics. It compares the heat of formation,
+every Mulliken charge, both frontier channels, the dipole and `⟨S²⟩`, at MOPAC's printed precision:
+1057 of 1086 comparisons pass, and [`docs/fidelity.md`](docs/fidelity.md) accounts for each of the
+29 that do not, case by case.
 
 ## References
 

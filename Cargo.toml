@@ -1,11 +1,11 @@
 [package]
 name = "pm7-rs"
-version = "0.1.2"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.82"
 license = "GPL-3.0-or-later"
 authors = ["ss0832"]
-description = "Rust-native PM7 semiempirical NDDO method with MOPAC-derived parameter tables and Rust, Python-native, and ASE APIs."
+description = "Rust-native PM7 semiempirical NDDO method with periodic boundary conditions (Gamma/k-point, analytic gradient, stress, and phonons), divide-and-conquer linear scaling, MOPAC-derived parameter tables, and Rust, Python-native, and ASE APIs."
 readme = "README.md"
 documentation = "https://docs.rs/pm7-rs"
 keywords = ["chemistry", "quantum-chemistry", "semiempirical", "pm7", "mopac"]
@@ -18,7 +18,6 @@ exclude = [
     ".mopac-source/",
     "tools/oracle/",
     "*.zip",
-    "am1-rs-proto-*.md",
     "**/__pycache__/",
     "**/*.pyc",
     "**/*.pyd",
@@ -41,11 +40,36 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
+# An unoptimized SCF is roughly two orders of magnitude slower than an optimized one, so a
+# debug-profile test run is not merely slow but unusable. Optimizing the dev/test profiles (and
+# dependencies at `3`) keeps `cargo test` usable without touching the shipping profile; debug
+# assertions and overflow checks stay on, which is the point of running the dev profile at all.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test]
+opt-level = 2
+
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+
 [dependencies]
 faer = { version = "0.24", default-features = false, features = ["std", "linalg", "rayon"] }
 rayon = "1.10"
-pyo3 = { version = "0.23.5", optional = true, features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.23.5", optional = true, features = ["extension-module", "abi3-py310"] }
 
 [features]
 default = []
 python = ["pyo3"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "scaling"
+harness = false

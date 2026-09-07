@@ -35,6 +35,45 @@ pub fn core_core_energy(molecule: &Molecule, params: &Pm7Parameters) -> Result<f
     Ok(terms?.iter().sum())
 }
 
+/// Core–core repulsion of a periodic cell, per unit cell, in eV.
+///
+/// In [`crate::pbc::PbcMode::Ewald`] the `Z_A Z_B / r` monopole of every pair is removed here
+/// because the Ewald sum supplies it for the whole lattice (through `q_A = Z_A − P_A`); what
+/// remains is the short-ranged `alpb`/`xfac` scaling, the core Gaussians, and the `r⁻¹²` guard,
+/// all of which have died out well before the pair cutoff.
+///
+/// The residual is not *identically* zero past 7 Å: an undefined pair keeps
+/// `10·exp(−2.18 r)·Z_A Z_B/r`, which is ~2e-7 eV at 9 Å and falls by a further decade every
+/// 1.1 Å. That is the truncation error of `PbcOptions::short_range_cutoff`, and it is why the
+/// cutoff is a public, convergence-testable parameter rather than a hard-coded 7 Å.
+pub fn core_core_energy_periodic(
+    molecule: &Molecule,
+    params: &Pm7Parameters,
+    pbc: &crate::pbc::PbcOptions,
+) -> Result<f64> {
+    use crate::pbc::{PairList, PbcMode};
+    use rayon::prelude::*;
+    let subtract_monopole = pbc.mode == PbcMode::Ewald;
+    let list = PairList::cached(molecule, pbc.short_range_cutoff);
+    let terms: Result<Vec<f64>> = list
+        .pairs
+        .par_iter()
+        .map(|p| -> Result<f64> {
+            let (zi, zj) = (molecule.atoms[p.a].z, molecule.atoms[p.b].z);
+            let ei = params.element(zi)?;
+            let ej = params.element(zj)?;
+            let full = pair_core_energy_scalar(ei, ej, zi, zj, p.r, params);
+            let mono = if subtract_monopole {
+                ei.core_charge * ej.core_charge * PM7_EV / p.r
+            } else {
+                0.0
+            };
+            Ok(p.weight * (full - mono))
+        })
+        .collect();
+    Ok(terms?.iter().sum())
+}
+
 /// Analytic Cartesian PM7 core-core gradient in eV/Bohr.
 pub fn core_core_gradient(molecule: &Molecule, params: &Pm7Parameters) -> Result<Vec<Vec3>> {
     use rayon::prelude::*;
@@ -63,6 +102,45 @@ pub fn core_core_gradient(molecule: &Molecule, params: &Pm7Parameters) -> Result
         gradient[j] += force;
     }
     Ok(gradient)
+}
+
+/// Core–core gradient and virial of a periodic cell, matching
+/// [`core_core_energy_periodic`] term for term.
+pub fn core_core_gradient_periodic(
+    molecule: &Molecule,
+    params: &Pm7Parameters,
+    pbc: &crate::pbc::PbcOptions,
+) -> Result<(Vec<Vec3>, crate::math::Mat3)> {
+    use crate::pbc::{PairList, PbcMode};
+    use rayon::prelude::*;
+    let subtract_monopole = pbc.mode == PbcMode::Ewald;
+    let list = PairList::cached(molecule, pbc.short_range_cutoff);
+    let contribs: Result<Vec<(usize, usize, Vec3, Vec3)>> = list
+        .pairs
+        .par_iter()
+        .map(|p| -> Result<(usize, usize, Vec3, Vec3)> {
+            let (zi, zj) = (molecule.atoms[p.a].z, molecule.atoms[p.b].z);
+            let ei = params.element(zi)?;
+            let ej = params.element(zj)?;
+            let full = pair_core_energy_scalar(ei, ej, zi, zj, Dual::var(p.r, 0), params);
+            // d/dr of the removed monopole `Z_i Z_j · PM7_EV / r`.
+            let dmono = if subtract_monopole {
+                -ei.core_charge * ej.core_charge * PM7_EV / (p.r * p.r)
+            } else {
+                0.0
+            };
+            let dedd = p.d / p.r * (p.weight * (full.d[0] - dmono));
+            Ok((p.a, p.b, dedd, p.d))
+        })
+        .collect();
+    let mut gradient = vec![Vec3::zero(); molecule.atoms.len()];
+    let mut virial = crate::math::Mat3::zero();
+    for (a, b, dedd, d) in contribs? {
+        gradient[a] -= dedd;
+        gradient[b] += dedd;
+        virial = virial.plus(&crate::math::Mat3::outer(dedd, d));
+    }
+    Ok((gradient, virial))
 }
 
 pub fn pair_core_energy_and_dr(

@@ -4,7 +4,7 @@
 
 use pm7_rs::optimizer::{optimize, OptOptions};
 use pm7_rs::scf::{run_pm7, Pm7Options};
-use pm7_rs::{Molecule, Pm7Parameters, Pm7Method};
+use pm7_rs::{Molecule, Pm7Method, Pm7Parameters};
 
 fn params() -> Pm7Parameters {
     Pm7Parameters::standard().unwrap()
@@ -116,6 +116,55 @@ fn gadolinium_trifluoride_uses_zeroed_sparkle_pairs() {
     );
 }
 
+/// La and Lu are the endpoints of the Sparkle range, and through v0.2.2 they were not sparkles.
+///
+/// `install_sparkles` used `58..=70` in both the parameter installation and the pair removal.
+/// That is MOPAC's range for PM7 **without** the `SPARKLE` keyword (`switch.F90:120-131`); with
+/// the keyword — which is what `Pm7Method::Pm7Sparkle` *is* — it is `57..=71`. So La and Lu kept
+/// their full nine-orbital PM7 parameters under a method that had promised to replace them with
+/// `+3` point charges, and no test covered either element.
+///
+/// The MOPAC references below are from `PM7 SPARKLE 1SCF PRECISE` on this exact geometry, via
+/// `tools/oracle/sparkles.py`, which sweeps all fifteen lanthanides and now agrees to the MOPAC
+/// print floor on every one of them. The errors this guards are 195 and 161 kcal/mol.
+#[test]
+fn the_sparkle_range_reaches_both_endpoints() {
+    let p = Pm7Parameters::method(Pm7Method::Pm7Sparkle).unwrap();
+    let o = Pm7Options {
+        method: Pm7Method::Pm7Sparkle,
+        ..Pm7Options::default()
+    };
+    // Planar D3h LnF3 at Ln-F = 2.10 A, written to the four decimals the oracle uses.
+    for (symbol, z, mopac) in [("La", 57_u8, -88.3460_f64), ("Lu", 71, 13.8977)] {
+        let xyz = format!(
+            "4\n{symbol}F3\n{symbol} 0.0 0.0 0.0\nF 2.1000 0.0 0.0\n\
+             F -1.0500 1.8187 0.0\nF -1.0500 -1.8187 0.0\n"
+        );
+        let mol = Molecule::from_xyz_str(&xyz, 0.0).unwrap();
+
+        // The parameter table is where the bug was, so assert on it directly and not only on the
+        // energy: a sparkle has no atomic orbitals and a +3 core.
+        let element = p.element(z).expect("sparkle parameters installed");
+        assert!(element.is_sparkle, "{symbol} is not a sparkle");
+        assert_eq!(element.n_orb, 0, "{symbol} kept its orbitals");
+        assert!((element.core_charge - 3.0).abs() < 1.0e-12);
+
+        let r = run_pm7(&mol, &p, &o).unwrap();
+        assert!(r.converged);
+        assert!(
+            (r.heat_of_formation_kcal - mopac).abs() < 0.02,
+            "{symbol}F3 dHf {} kcal/mol, MOPAC says {mopac} \
+             (is the sparkle range 58..=70 again?)",
+            r.heat_of_formation_kcal
+        );
+        assert!(
+            (r.charges[0] - 3.0).abs() < 0.05,
+            "{symbol} charge {} -- a sparkle is fully ionic",
+            r.charges[0]
+        );
+    }
+}
+
 #[test]
 fn axis_aligned_bond_derivatives_match_numerical() {
     // A bond exactly on the local-frame rotation's singular axis (sp two-electron frame: +x;
@@ -165,6 +214,57 @@ fn axis_aligned_bond_derivatives_match_numerical() {
             hmax < 5.0e-3,
             "{name} axis-aligned Hessian vs numeric {hmax:.2e}"
         );
+    }
+}
+
+#[test]
+fn every_axis_direction_is_guarded_against_the_frame_singularity() {
+    // The sp path has two singular directions, not one: the two-electron rotation is singular
+    // for a bond along +x and the *overlap* rotation for a bond along −x, because they feed
+    // opposite arguments to the same routine. Guarding only +x — as v0.1.2 did — left a bond
+    // pointing along −x with a 0.33 eV/Bohr error in the perpendicular gradient component,
+    // which the single-orientation test above could not see.
+    //
+    // This sweeps all six axis directions for each of the sp and d paths, so a future change to
+    // either rotation cannot reintroduce a one-sided guard.
+    use pm7_rs::gradient::{closed_form_gradient, numerical_gradient};
+    let p = params();
+    let o = Pm7Options::default();
+    const AXES: [([f64; 3], &str); 6] = [
+        ([1.0, 0.0, 0.0], "+x"),
+        ([-1.0, 0.0, 0.0], "-x"),
+        ([0.0, 1.0, 0.0], "+y"),
+        ([0.0, -1.0, 0.0], "-y"),
+        ([0.0, 0.0, 1.0], "+z"),
+        ([0.0, 0.0, -1.0], "-z"),
+    ];
+    // (heavy atom, bond length Å, off-axis partner) for the sp and MNDO/d paths.
+    for (z, bond, label) in [(8u8, 0.9584_f64, "O-H"), (16, 1.34, "S-H")] {
+        for (axis, name) in AXES {
+            // Place the on-axis hydrogen exactly along `axis`, and a second hydrogen well off
+            // any axis so the molecule is a genuine three-body system.
+            let on = [axis[0] * bond, axis[1] * bond, axis[2] * bond];
+            let xyz = format!(
+                "3\n{label}{name}\n{sym} 0.0 0.0 0.0\nH {:.6} {:.6} {:.6}\nH 0.31 0.83 0.47\n",
+                on[0],
+                on[1],
+                on[2],
+                sym = pm7_rs::z_to_symbol(z).unwrap(),
+            );
+            let mol = Molecule::from_xyz_str(&xyz, 0.0).unwrap();
+            let ga = closed_form_gradient(&mol, &p, &o).unwrap();
+            let gn = numerical_gradient(&mol, &p, &o, 4.0e-3).unwrap();
+            let mut worst = 0.0_f64;
+            for (a, b) in ga.gradient.iter().zip(&gn.gradient) {
+                for k in 0..3 {
+                    worst = worst.max((a.get(k) - b.get(k)).abs());
+                }
+            }
+            assert!(
+                worst < 1.0e-3,
+                "{label} along {name}: analytic vs numerical gradient differs by {worst:.2e} eV/Bohr"
+            );
+        }
     }
 }
 
@@ -321,7 +421,7 @@ fn water_optimizes_to_pm7_minimum() {
     )
     .unwrap();
     assert!(res.converged);
-    assert!((res.scf.heat_of_formation_kcal + 57.8).abs() < 0.5);
+    assert!((res.heat_of_formation_kcal + 57.8).abs() < 0.5);
 }
 
 #[test]

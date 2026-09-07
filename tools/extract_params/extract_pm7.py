@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Extract reproducible PM7 tables from a pinned MOPAC source checkout.
+
+The tables this emits are derived from MOPAC v23.2.5 (Apache-2.0, (c) 2021 Virginia Tech);
+`THIRD_PARTY_NOTICES.md` records the attribution and `third_party/mopac/LICENSE` carries the
+license text that has to travel with anything built from them.
 
 The MOPAC PM7 parameter files are Fortran ``data`` statements.  This script keeps
 the generated Rust inputs auditable: it accepts only a source tree, performs no

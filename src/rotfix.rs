@@ -3,9 +3,19 @@
 //! Robust derivative fallback for the two-center integrals of a bond that is (near-)exactly
 //! aligned with the singular axis of its local-frame rotation.
 //!
-//! The sp two-electron frame [`crate::integrals::rotation_to_x_g`] is singular for a bond
-//! along **+x** (`qw = vx + 1 → 0`), and the MNDO/d `rotmat`/`coe` rotations for a bond along
-//! **±z** (`sin(polar) → 0`). At the antipode the rotation is genuinely direction-
+//! The sp path has **two** singular directions, because its two-centre integrals and its
+//! overlap use the same rotation with opposite arguments:
+//!
+//! * [`crate::integrals::pair_two_electron_g`] rotates `−x̂_ij`, so `qw = vx + 1 → 0` when the
+//!   bond is along **+x**;
+//! * [`crate::overlap::build_di_g`] rotates `+x̂_ij`, so it is singular when the bond is along
+//!   **−x**.
+//!
+//! Guarding only the first — as this module originally did — leaves an exactly `−x`-aligned
+//! bond with a silently wrong perpendicular derivative: about 0.33 eV/Bohr for a water dimer,
+//! large enough to move a geometry optimization to the wrong structure. The MNDO/d `rotmat`/`coe`
+//! rotations are singular for a bond along **±z** (`sin(polar) → 0`), and that check was already
+//! two-sided. At the antipode the rotation is genuinely direction-
 //! discontinuous: its forward-mode (Dual/Dual2) derivative collapses to the constant special
 //! case with zero slope, so the *perpendicular* component of the analytic gradient/Hessian is
 //! lost. The integral **values** are correct everywhere (the f64 special case is a valid
@@ -29,8 +39,12 @@ const H2: f64 = 2.0e-3;
 /// Angular window (≈ `acos(1 - TOL)` ≈ 0.8°) around the singular axis.
 const TOL: f64 = 1.0e-4;
 
-/// True when the displacement `d` sits in the singular window of the local-frame rotation
-/// used by this pair's integral path (sp path: bond ∥ +x; d path: bond ∥ ±z).
+/// True when the displacement `d` sits in the singular window of a local-frame rotation used by
+/// this pair's integral path (sp path: bond ∥ **±x**; d path: bond ∥ ±z).
+///
+/// Both signs matter on the sp path: `+x` is singular for the two-electron rotation and `−x` for
+/// the overlap rotation, because the two feed opposite arguments to the same routine. See the
+/// module docs.
 pub(crate) fn near_frame_singularity(d: Vec3, has_d: bool) -> bool {
     let n2 = d.x * d.x + d.y * d.y + d.z * d.z;
     if n2 <= 0.0 {
@@ -40,7 +54,7 @@ pub(crate) fn near_frame_singularity(d: Vec3, has_d: bool) -> bool {
     if has_d {
         (d.x * d.x + d.y * d.y).sqrt() / n < TOL
     } else {
-        d.x / n > 1.0 - TOL
+        (d.x / n).abs() > 1.0 - TOL
     }
 }
 
@@ -106,21 +120,16 @@ pub(crate) fn pair_dual_fd(
             (p[2] - m[2]) / (2.0 * H),
         ],
     };
-    let w: Vec<Vec<Dual>> = te0
+    let w: Vec<Dual> = te0
         .w
         .iter()
         .enumerate()
-        .map(|(i, row)| {
-            row.iter()
-                .enumerate()
-                .map(|(j, &b)| {
-                    du(
-                        b,
-                        [tp[0].w[i][j], tp[1].w[i][j], tp[2].w[i][j]],
-                        [tm[0].w[i][j], tm[1].w[i][j], tm[2].w[i][j]],
-                    )
-                })
-                .collect()
+        .map(|(k, &b)| {
+            du(
+                b,
+                [tp[0].w[k], tp[1].w[k], tp[2].w[k]],
+                [tm[0].w[k], tm[1].w[k], tm[2].w[k]],
+            )
         })
         .collect();
     let mut e1b = [[Dual::constant(0.0); 9]; 9];
@@ -149,6 +158,8 @@ pub(crate) fn pair_dual_fd(
         PairTwoElecG {
             norb_i: te0.norb_i,
             norb_j: te0.norb_j,
+            npair_i: te0.npair_i,
+            npair_j: te0.npair_j,
             w,
             e1b,
             e2a,
@@ -251,12 +262,8 @@ pub(crate) fn pair_dual2_fd(
         }
     };
     let dummy_s = [[0.0f64; 9]; 9];
-    let w: Vec<Vec<Dual2>> = (0..te0.w.len())
-        .map(|i| {
-            (0..te0.w[i].len())
-                .map(|j| cw(&|t| t.w[i][j], &|_| 0.0, &te0, &dummy_s, false))
-                .collect()
-        })
+    let w: Vec<Dual2> = (0..te0.w.len())
+        .map(|k| cw(&|t| t.w[k], &|_| 0.0, &te0, &dummy_s, false))
         .collect();
     let mut e1b = [[Dual2::constant(0.0); 9]; 9];
     let mut e2a = [[Dual2::constant(0.0); 9]; 9];
@@ -272,6 +279,8 @@ pub(crate) fn pair_dual2_fd(
         PairTwoElecG {
             norb_i: te0.norb_i,
             norb_j: te0.norb_j,
+            npair_i: te0.npair_i,
+            npair_j: te0.npair_j,
             w,
             e1b,
             e2a,

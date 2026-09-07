@@ -126,9 +126,87 @@ impl Matrix {
     }
 
     /// Frobenius inner product `Σ_ij A_ij B_ij` (used for energies `½Σ P(H+F)`).
+    /// Overwrite this matrix's contents from another of the same shape, **without reallocating**.
+    ///
+    /// For reusing a buffer that is about to be overwritten anyway — an SCF history slot, say —
+    /// instead of dropping its allocation and taking a fresh one for the clone that replaces it.
+    pub fn copy_from(&mut self, other: &Matrix) {
+        debug_assert_eq!((self.rows, self.cols), (other.rows, other.cols));
+        self.data.copy_from_slice(&other.data);
+    }
+
     pub fn frobenius_dot(&self, other: &Matrix) -> f64 {
         debug_assert_eq!(self.data.len(), other.data.len());
         self.data.iter().zip(&other.data).map(|(a, b)| a * b).sum()
+    }
+}
+
+/// How a factor enters a product: as itself, or transposed.
+///
+/// Transposing through a *view* rather than a copy is most of the point. `Cvᵀ F Co` and
+/// `Cv U Coᵀ` are the two products the CPHF runs thousands of times, and building the transpose
+/// with [`Matrix::transpose`] each time allocates and fills an `nao × n_occ` matrix for nothing —
+/// faer reads a transposed view at zero cost by swapping the strides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Normal,
+    Transposed,
+}
+
+impl Matrix {
+    fn faer_view(&self) -> faer::MatRef<'_, f64> {
+        faer::MatRef::from_row_major_slice(&self.data, self.rows, self.cols)
+    }
+
+    /// `op(a) · op(b)`, through faer's blocked GEMM.
+    ///
+    /// The hand-written `ikj` loop this replaces is cache-friendly but scalar: it does not block
+    /// for L2, does not use FMA lanes, and cannot reuse a packed panel across output columns. On
+    /// the 102-atom analytic Hessian the two CPHF products were **48 % of the whole run** — more
+    /// than the Fock builds — which is not a ratio any amount of loop tidying was going to fix.
+    ///
+    /// The summation order differs from the `ikj` loop, so results move in the last ulp or two.
+    /// It is still deterministic for a given shape (faer's blocking depends on the dimensions, not
+    /// on thread scheduling), so runs remain reproducible; only the comparison against the *old*
+    /// code changes. That is the right trade here: this path feeds an iterative solver converged
+    /// to `1e-9` whose output is checked against finite differences.
+    pub fn gemm(&self, a_side: Side, b: &Matrix, b_side: Side, parallel: bool) -> Matrix {
+        let a_view = match a_side {
+            Side::Normal => self.faer_view(),
+            Side::Transposed => self.faer_view().transpose(),
+        };
+        let b_view = match b_side {
+            Side::Normal => b.faer_view(),
+            Side::Transposed => b.faer_view().transpose(),
+        };
+        assert_eq!(
+            a_view.ncols(),
+            b_view.nrows(),
+            "gemm dimension mismatch: {}x{} times {}x{}",
+            a_view.nrows(),
+            a_view.ncols(),
+            b_view.nrows(),
+            b_view.ncols()
+        );
+        let mut out = Matrix::zeros(a_view.nrows(), b_view.ncols());
+        if out.data.is_empty() {
+            return out;
+        }
+        let (rows, cols) = (out.rows, out.cols);
+        let dst = faer::MatMut::from_row_major_slice_mut(&mut out.data, rows, cols);
+        faer::linalg::matmul::matmul(
+            dst,
+            faer::Accum::Replace,
+            a_view,
+            b_view,
+            1.0_f64,
+            if parallel {
+                faer::Par::rayon(0)
+            } else {
+                faer::Par::Seq
+            },
+        );
+        out
     }
 }
 
@@ -160,14 +238,33 @@ pub fn symmetric_eigen(a: &Matrix) -> Result<(Vec<f64>, Matrix)> {
     if n == 0 {
         return Ok((Vec::new(), Matrix::zeros(0, 0)));
     }
-    let fa = faer::Mat::<f64>::from_fn(n, n, |i, j| a[(i, j)]);
-    let eigen = fa
+    // A borrowed row-major view, not a copy. `Mat::from_fn` walked this matrix column-major over
+    // a row-major buffer — an `N²` strided read on every diagonalization, and there is one of
+    // those per SCF iteration, per k point, and per divide-and-conquer subsystem.
+    let eigen = a
+        .faer_view()
         .self_adjoint_eigen(faer::Side::Lower)
         .map_err(|e| Pm7Error::LinearAlgebra(format!("faer eigendecomposition failed: {e:?}")))?;
     let s = eigen.S();
     let u = eigen.U();
-    // Sort eigenpairs into ascending order (the SCF aufbau occupies the lowest orbitals;
-    // faer's ordering is not guaranteed ascending, so enforce it here).
+
+    // The SCF aufbau occupies the lowest orbitals and faer's ordering is not guaranteed ascending,
+    // so it has to be enforced. In practice it comes back ascending already, and checking for that
+    // is `O(N)` against an `O(N²)` strided permutation copy — so the common case now writes the
+    // eigenvectors out row by row, contiguously, instead of column by column.
+    let ascending = (1..n).all(|i| s[i - 1] <= s[i]);
+    if ascending {
+        let values: Vec<f64> = (0..n).map(|k| s[k]).collect();
+        let mut vectors = Matrix::zeros(n, n);
+        for i in 0..n {
+            let row = &mut vectors.as_mut_slice()[i * n..(i + 1) * n];
+            for (j, slot) in row.iter_mut().enumerate() {
+                *slot = u[(i, j)];
+            }
+        }
+        return Ok((values, vectors));
+    }
+
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&i, &j| s[i].partial_cmp(&s[j]).unwrap_or(std::cmp::Ordering::Equal));
     let values: Vec<f64> = order.iter().map(|&k| s[k]).collect();

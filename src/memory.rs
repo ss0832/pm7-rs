@@ -118,7 +118,13 @@ pub fn guard(
 }
 
 /// Best-effort total physical RAM in bytes (`None` if it cannot be determined).
+///
+/// This is the **only** `unsafe` block in the crate; `src/lib.rs` carries
+/// `#![deny(unsafe_code)]` so that stays machine-checked rather than merely true today. There is
+/// no safe Rust path to the Windows memory counters and no dependency worth taking for one call:
+/// the crate's whole dependency list is `faer`, `rayon`, and an optional `pyo3`.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn available_memory_bytes() -> Option<u64> {
     #[repr(C)]
     struct MemoryStatusEx {
@@ -132,6 +138,13 @@ fn available_memory_bytes() -> Option<u64> {
         avail_virtual: u64,
         avail_extended_virtual: u64,
     }
+    // SAFETY: `MemoryStatusEx` is `#[repr(C)]` and matches the Win32 `MEMORYSTATUSEX` layout
+    // field for field; every field is a plain integer, so the all-zero bit pattern
+    // `mem::zeroed` writes is a valid value of the type. `GlobalMemoryStatusEx` requires
+    // `length` to be set to the struct size before the call — done on the next line — and
+    // writes only within the struct it is handed. The pointer comes from a live local, so it
+    // is non-null, aligned, and valid for the whole call. The return value is checked before
+    // any field is read.
     #[link(name = "kernel32")]
     extern "system" {
         fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;

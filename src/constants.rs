@@ -33,6 +33,31 @@ pub const HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM: f64 = HARTREE_TO_EV / BOHR_TO_ANG
 /// Atomic-unit dipole (e·a0) to Debye.
 pub const AU_DIPOLE_TO_DEBYE: f64 = 2.541_746_473;
 
+/// Debye to e·Ångström: the conversion the ASE boundary needs for a dipole.
+///
+/// Derived rather than tabulated — `1 e·a0 = AU_DIPOLE_TO_DEBYE` Debye and `a0` is the Bohr radius
+/// in Ångström, so one Debye is `a0 / AU_DIPOLE_TO_DEBYE` e·Å. Equals 0.2081943…
+pub const DEBYE_TO_E_ANGSTROM: f64 = PM7_A0 / AU_DIPOLE_TO_DEBYE;
+
+/// The elementary charge expressed as Debye per Ångström: `1 e = 4.803204…  D/Å`.
+///
+/// A dipole *derivative* `∂mu/∂x` in atomic units (e·Bohr per Bohr, i.e. `e`) becomes D/Å by this
+/// factor, which is the unit the spectroscopy literature — and MOPAC's `DIPT` — reports.
+pub const E_IN_DEBYE_PER_ANGSTROM: f64 = 1.0 / DEBYE_TO_E_ANGSTROM;
+
+/// `|∂mu/∂Q|²` in (D/Å)²/amu to the conventional IR intensity unit, km/mol.
+///
+/// The double-harmonic integrated absorption coefficient is `A = (N_A π / 3c²) |∂mu/∂Q|²`; in
+/// these working units that group is 42.2561 km/mol per (D/Å)²/amu, the value every
+/// spectroscopy text quotes for exactly this conversion.
+pub const IR_DEBYE_ANG2_PER_AMU_TO_KM_PER_MOL: f64 = 42.256_1;
+
+/// `|∂mu/∂Q|²` in e²/amu to km/mol — the same conversion with the derivative left in atomic units.
+///
+/// Two routes to one number: a test asserts they agree, so a slip in either cannot pass silently.
+pub const IR_E2_PER_AMU_TO_KM_PER_MOL: f64 =
+    IR_DEBYE_ANG2_PER_AMU_TO_KM_PER_MOL * E_IN_DEBYE_PER_ANGSTROM * E_IN_DEBYE_PER_ANGSTROM;
+
 /// Cordero/Pyykkö-style covalent radii (Å), used only for geometric bond perception
 /// in geometry utilities — generic element data, not PM7 model parameters.
 /// Index by atomic number; unknown Z falls back to 1.5 Å.

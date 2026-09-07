@@ -29,6 +29,14 @@ pub enum Pm7Error {
         iterations: usize,
         error: f64,
     },
+    /// A linear-response solve failed to converge, or produced a result that violates an
+    /// invariant it is required to satisfy.
+    ///
+    /// Separate from [`Self::ScfNotConverged`] because the failure mode is different: the response
+    /// is a *linear* fixed point, so it does not wander near an answer, it diverges geometrically
+    /// and returns a number many orders of magnitude too large. It has to be refused rather than
+    /// reported with a flag.
+    ResponseFailed(String),
     /// The estimated peak memory for this system exceeds the configured/available budget.
     /// Raised *before* the large allocations, so the process fails cleanly instead of being
     /// OOM-killed mid-run.
@@ -53,6 +61,7 @@ impl fmt::Display for Pm7Error {
                 f,
                 "PM7 SCF did not converge after {iterations} iterations (error={error:.3e})"
             ),
+            Self::ResponseFailed(msg) => write!(f, "linear response failed: {msg}"),
             Self::InsufficientMemory {
                 needed_mb,
                 budget_mb,

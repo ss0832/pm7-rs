@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Collect the license notices of every Rust crate linked into the shipped binaries.
+
+`cargo build` statically links its whole dependency graph. `_native.pyd` inside the Python
+wheel and the `pm7_rs_cli` executable are therefore *copies of substantial portions* of
+several dozen crates, nearly all MIT or Apache-2.0.  Both licenses require the notices to
+travel with the copy: MIT by name ("The above copyright notice and this permission notice
+shall be included in all copies or substantial portions of the Software"), Apache-2.0 by
+sections 4(a) and 4(b).  Nothing in the tree carried them through 0.2.2.
+
+This script writes `third_party/rust/NOTICES.md` from the resolved dependency graph, so the
+notice cannot drift from what is actually linked:
+
+* the graph is walked from the root package over **normal and build** edges only -- dev
+  dependencies (criterion and its tree) are not in the shipped artifacts and are excluded,
+  and the walk is what decides that rather than a hand-kept list;
+* license texts come from the crate sources in the local registry, which is the text the
+  author shipped, not a reconstruction from the SPDX id;
+* identical texts are emitted once and shared, because sixty copies of the Apache-2.0 text
+  is not a notice, it is a haystack.  Each text is preceded by the crates it covers.
+
+It performs no network access: everything read is already in `~/.cargo/registry`.
+
+    python tools/licenses/collect_rust_notices.py [--check]
+
+`--check` re-generates and exits non-zero if the file on disk differs, which is what CI and
+`tests/attribution.rs` want.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+OUTPUT = ROOT / "third_party" / "rust" / "NOTICES.md"
+
+# Dependency kinds that end up in the shipped artifacts.  `None` is cargo's spelling for a
+# normal dependency; "build" crates run at compile time but their generated code is linked,
+# so they are included too.  "dev" is excluded: criterion never reaches a released binary.
+LINKED_KINDS = {None, "build"}
+
+LICENSE_FILE_HINTS = ("LICENSE", "LICENCE", "COPYING", "NOTICE", "UNLICENSE")
+
+
+def metadata() -> dict:
+    out = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--all-features"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if out.returncode != 0:
+        raise SystemExit(f"cargo metadata failed:\n{out.stderr}")
+    return json.loads(out.stdout)
+
+
+def linked_packages(meta: dict) -> list[dict]:
+    """Every package reachable from the root over normal and build edges."""
+    packages = {p["id"]: p for p in meta["packages"]}
+    nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
+    root = meta["resolve"]["root"]
+
+    seen: set[str] = set()
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for dependency in nodes[current]["deps"]:
+            kinds = {d.get("kind") for d in dependency.get("dep_kinds", [{}])}
+            if kinds & LINKED_KINDS:
+                stack.append(dependency["pkg"])
+
+    seen.discard(root)
+    return sorted((packages[i] for i in seen), key=lambda p: (p["name"].lower(), p["version"]))
+
+
+def license_texts(package: dict) -> list[tuple[str, str]]:
+    """The license files shipped inside the crate, as (file name, text)."""
+    manifest = Path(package["manifest_path"])
+    found: list[tuple[str, str]] = []
+    for path in sorted(manifest.parent.iterdir()):
+        if not path.is_file():
+            continue
+        name = path.name
+        if not any(name.upper().startswith(hint) for hint in LICENSE_FILE_HINTS):
+            continue
+        if path.suffix.lower() in (".rs", ".toml", ".py"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # A NOTICE file that only points at the license adds nothing; a real one carries
+        # attribution that Apache-2.0 4(d) requires be reproduced.
+        if text.strip():
+            found.append((name, text.replace("\r\n", "\n").strip()))
+    return found
+
+
+def holders(package: dict) -> str:
+    authors = package.get("authors") or []
+    # Strip the addresses: they are contact details for the upstream, not part of the
+    # notice, and reproducing them here is a way to get people mail they did not ask for.
+    cleaned = []
+    for author in authors:
+        name = author.split("<", 1)[0].strip().rstrip(",")
+        if name and name not in cleaned:
+            cleaned.append(name)
+    return ", ".join(cleaned) if cleaned else "see the license text"
+
+
+def render(packages: list[dict]) -> str:
+    lines: list[str] = []
+    add = lines.append
+
+    add("<!-- Generated by tools/licenses/collect_rust_notices.py; do not hand edit. -->")
+    add("")
+    add("# Rust dependency notices")
+    add("")
+    add(
+        "The `pm7_rs_cli` executable and the `pm7_rs._native` extension module inside the Python"
+    )
+    add(
+        "wheel are statically linked. Every crate below is compiled into them, so distributing"
+    )
+    add(
+        "either binary redistributes those crates and carries their notice obligations -- MIT"
+    )
+    add(
+        "requires the copyright and permission notice in \"all copies or substantial portions\","
+    )
+    add("Apache-2.0 requires the same by sections 4(a) and 4(b).")
+    add("")
+    add(
+        "This file is generated from the resolved dependency graph over normal and build edges."
+    )
+    add(
+        "Development-only dependencies (criterion and its tree) are excluded because they are not"
+    )
+    add("in any shipped artifact.")
+    add("")
+    add(
+        "The list is the union over **every target platform**, not the one that happened to build"
+    )
+    add(
+        "it. Around a third of these crates are platform-gated -- the `windows_*` import libraries,"
+    )
+    add(
+        "`hermit-abi`, `sysctl` -- and generating the notice per host would give each wheel a"
+    )
+    add(
+        "different list, each one correct only for itself and unverifiable from any other machine."
+    )
+    add("One list that covers every release is the useful thing to ship.")
+    add("")
+    add(
+        "Re-generate with `python tools/licenses/collect_rust_notices.py`;"
+        " `tests/attribution.rs`"
+    )
+    add("fails if it drifts from `Cargo.lock`.")
+    add("")
+    add(f"{len(packages)} crates.")
+    add("")
+    add("## Crates")
+    add("")
+    add("| Crate | Version | License | Copyright |")
+    add("|---|---|---|---|")
+    for package in packages:
+        license_id = package.get("license") or "see the license text"
+        add(
+            f"| {package['name']} | {package['version']} | {license_id} | {holders(package)} |"
+        )
+    add("")
+
+    # Group identical texts.  `pulp`, `gemm` and the whole faer family ship the same two
+    # files; emitting them once keeps the file readable and loses nothing.
+    grouped: dict[str, dict] = {}
+    order: list[str] = []
+    missing: list[str] = []
+    for package in packages:
+        texts = license_texts(package)
+        if not texts:
+            missing.append(f"{package['name']} {package['version']}")
+            continue
+        for name, text in texts:
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if digest not in grouped:
+                grouped[digest] = {"name": name, "text": text, "crates": []}
+                order.append(digest)
+            entry = f"{package['name']} {package['version']}"
+            if entry not in grouped[digest]["crates"]:
+                grouped[digest]["crates"].append(entry)
+
+    add("## License texts")
+    add("")
+    add(
+        "Each text below is reproduced verbatim from the crate source, once per distinct text,"
+    )
+    add("preceded by the crates it covers.")
+    add("")
+    for index, digest in enumerate(order, start=1):
+        entry = grouped[digest]
+        add(f"### {index}. {entry['name']}")
+        add("")
+        add("Covers: " + ", ".join(f"`{c}`" for c in entry["crates"]) + ".")
+        add("")
+        add("```")
+        add(entry["text"])
+        add("```")
+        add("")
+
+    if missing:
+        add("## Crates shipping no license file")
+        add("")
+        add(
+            "These crates declare a license in their manifest but ship no license file in the"
+        )
+        add(
+            "published source. The SPDX identifier in the table above is the licensor's own"
+        )
+        add("declaration and the standard text for it applies.")
+        add("")
+        for entry in missing:
+            add(f"- {entry}")
+        add("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit non-zero if the generated file differs from the one on disk",
+    )
+    args = parser.parse_args()
+
+    text = render(linked_packages(metadata()))
+
+    if args.check:
+        current = OUTPUT.read_text(encoding="utf-8") if OUTPUT.exists() else ""
+        if current != text:
+            raise SystemExit(
+                f"{OUTPUT.relative_to(ROOT)} is out of date; "
+                "re-run tools/licenses/collect_rust_notices.py"
+            )
+        print(f"{OUTPUT.relative_to(ROOT)} is up to date")
+        return
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT.write_text(text, encoding="utf-8", newline="\n")
+    print(f"wrote {OUTPUT.relative_to(ROOT)} ({len(text)} bytes)")
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)

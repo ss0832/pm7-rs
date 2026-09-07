@@ -1086,11 +1086,11 @@ pub fn pair_two_electron_d_g<S: Scalar>(
     // PM7 always applies the d-balance correction (only active for iod > 0 atoms).
     pm7_balance(&mut ww, &mut core, ei, ej);
 
-    // Molecular-frame w: w[pi][pj] with pi over atom-i pairs, pj over atom-j pairs.
-    let mut w = vec![vec![S::cst(0.0); limkl]; limij];
+    // Molecular-frame w, flat row-major `w[pi * limkl + pj]` (`ww` is 1-based).
+    let mut w = vec![S::cst(0.0); limij * limkl];
     for pi in 0..limij {
         for pj in 0..limkl {
-            w[pi][pj] = ww[pi * limkl + pj + 1];
+            w[pi * limkl + pj] = ww[pi * limkl + pj + 1];
         }
     }
     let e1b = elenuc_block(&core, &rot, 1, ii);
@@ -1099,6 +1099,8 @@ pub fn pair_two_electron_d_g<S: Scalar>(
     PairTwoElecG {
         norb_i: ii,
         norb_j: kk,
+        npair_i: limij,
+        npair_j: limkl,
         w,
         e1b,
         e2a,
@@ -1129,7 +1131,7 @@ mod tests {
         let mut e = 0.0;
         for a in 0..ni {
             for c in 0..nj {
-                e += te.w[pk(a, a)][pk(c, c)];
+                e += te.at(pk(a, a), pk(c, c));
             }
         }
         e
@@ -1198,13 +1200,13 @@ mod tests {
         let (cfrac, point) = crate::integrals::feather_to_point(r);
         let expect = nddo * cfrac + point * (1.0 - cfrac);
         assert!(
-            (a.w[0][0] - expect).abs() < 1.0e-9,
+            (a.at(0, 0) - expect).abs() < 1.0e-9,
             "ssss={} expect={}",
-            a.w[0][0],
+            a.at(0, 0),
             expect
         );
         assert!(
-            (a.w[0][0] - b.w[0][0]).abs() < 1.0e-9,
+            (a.at(0, 0) - b.at(0, 0)).abs() < 1.0e-9,
             "not rotation invariant"
         );
     }
@@ -1229,10 +1231,10 @@ mod tests {
             dm[axis] -= step;
             let wp = pair_two_electron_d_g::<f64>(s, h, dp);
             let wm = pair_two_electron_d_g::<f64>(s, h, dm);
-            for a in 0..wp.w.len() {
-                for b in 0..wp.w[a].len() {
-                    let fd = (wp.w[a][b] - wm.w[a][b]) / (2.0 * step);
-                    maxerr = maxerr.max((dual.w[a][b].d[axis] - fd).abs());
+            for a in 0..wp.npair_i {
+                for b in 0..wp.npair_j {
+                    let fd = (wp.at(a, b) - wm.at(a, b)) / (2.0 * step);
+                    maxerr = maxerr.max((dual.at(a, b).d[axis] - fd).abs());
                 }
             }
         }

@@ -134,10 +134,8 @@ fn all_element_pairs_two_electron_integrals_finite() {
                     let r = ra * ANGSTROM_TO_BOHR;
                     let te = pair_two_electron_g::<f64>(ei, ej, [r, 0.0, 0.0]);
                     let mut bad = false;
-                    for row in &te.w {
-                        for &v in row {
-                            bad |= !v.is_finite();
-                        }
+                    for &v in &te.w {
+                        bad |= !v.is_finite();
                     }
                     for row in &te.e1b {
                         for &v in row {

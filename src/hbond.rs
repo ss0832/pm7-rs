@@ -194,9 +194,74 @@ fn bonding(nat: &[u8], x: usize, y: usize) -> f64 {
     covrad_scaled(nat[x]) + covrad_scaled(nat[y])
 }
 
+/// A uniform spatial hash over a subset of the atoms, for the topology searches below.
+///
+/// Every search in `build_hbonds` has a hard distance cutoff — 1.4 Å for a covalent X–H, 7.0 Å
+/// for the acceptor pair, a covalent-radius sum for the neighbour list — and every one of them
+/// used to be a full scan over all atoms. That made the topology `O(N²)` (and the candidate dedup
+/// `O(P²)`) inside a routine whose *derivatives* are already linear. Measured on a water wire:
+/// 80 → 160 → 320 monomers cost 1.75 → 5.82 → 21.99 ms, ratios of 3.3 and 3.8 against the 2.0 a
+/// linear method would show.
+///
+/// **The results are identical, not merely equivalent.** The grid only proposes candidates; each
+/// search then sorts them back into ascending atom order before testing, which is the order the
+/// original `for j in 0..numat` scans used. That matters because the outcomes are order-dependent:
+/// the first acceptor to claim a hydrogen keeps it, and the neighbour list drops its longest bond
+/// once a fifth arrives.
+struct CellGrid {
+    spacing: f64,
+    buckets: std::collections::HashMap<[i64; 3], Vec<usize>>,
+}
+
+impl CellGrid {
+    /// Bucket `members` on a lattice of `spacing`, which must be at least the search radius so
+    /// that the 27 cells around a point cover it.
+    fn new(coords: &[Vec3], members: impl Iterator<Item = usize>, spacing: f64) -> Self {
+        let spacing = spacing.max(1.0e-6);
+        let mut buckets: std::collections::HashMap<[i64; 3], Vec<usize>> =
+            std::collections::HashMap::new();
+        for index in members {
+            buckets
+                .entry(Self::key(coords[index], spacing))
+                .or_default()
+                .push(index);
+        }
+        Self { spacing, buckets }
+    }
+
+    #[inline]
+    fn key(p: Vec3, spacing: f64) -> [i64; 3] {
+        [
+            (p.x / spacing).floor() as i64,
+            (p.y / spacing).floor() as i64,
+            (p.z / spacing).floor() as i64,
+        ]
+    }
+
+    /// Members within one cell of `p`, **sorted ascending** so callers see the original scan order.
+    fn near(&self, p: Vec3, out: &mut Vec<usize>) {
+        out.clear();
+        let cell = Self::key(p, self.spacing);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(members) =
+                        self.buckets
+                            .get(&[cell[0] + dx, cell[1] + dy, cell[2] + dz])
+                    {
+                        out.extend_from_slice(members);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+    }
+}
+
 /// Build the list of hydrogen bonds for the current geometry (topology only; indices are 0-based).
 /// Reproduces `all_h_bonds` + `setup_DH_Plus`.
 fn build_hbonds(coords: &[Vec3], nat: &[u8]) -> Vec<HBond> {
+    let _stage = crate::profile::stage("hbond: topology");
     let numat = coords.len();
     // Any N or O acceptors at all?  (max_h_bonds gate)
     if !nat.iter().any(|&z| z == 7 || z == 8) {
@@ -205,14 +270,17 @@ fn build_hbonds(coords: &[Vec3], nat: &[u8]) -> Vec<HBond> {
 
     // find_XH_bonds (PM7: RAH = 1.4 Å, acceptors = N/O).
     let rah2 = 1.4 * 1.4;
+    let hydrogen_grid = CellGrid::new(coords, (0..numat).filter(|&j| nat[j] == 1), 1.4);
     let mut acceptors: Vec<usize> = Vec::new();
     let mut bonding_h: Vec<usize> = Vec::new();
     let mut used = vec![false; numat];
+    let mut candidates: Vec<usize> = Vec::new();
     for i in 0..numat {
         if nat[i] == 7 || nat[i] == 8 {
             acceptors.push(i);
-            for j in 0..numat {
-                if nat[j] == 1 && !used[j] && (coords[i] - coords[j]).norm2() < rah2 {
+            hydrogen_grid.near(coords[i], &mut candidates);
+            for &j in &candidates {
+                if !used[j] && (coords[i] - coords[j]).norm2() < rah2 {
                     bonding_h.push(j);
                     used[j] = true;
                 }
@@ -222,14 +290,40 @@ fn build_hbonds(coords: &[Vec3], nat: &[u8]) -> Vec<HBond> {
 
     // find_H__Y_bonds (PM7: RAH = 1.4, cutoff = 7.0).
     let cutoff2 = 7.0 * 7.0;
+    let acceptor_grid = CellGrid::new(coords, acceptors.iter().copied(), 7.0);
     // pairs: (hblist1 = heavy atom bonded to H, hblist2 = H, hblist3 = distant acceptor)
     let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+    // The dedup was a linear scan of everything found so far, inside the innermost body — `O(P²)`
+    // in the number of candidate bonds. The key is the unordered acceptor pair plus the hydrogen,
+    // which is exactly what the scan tested for.
+    let mut seen: std::collections::HashSet<(usize, usize, usize)> =
+        std::collections::HashSet::new();
+    // Where each bonded hydrogen sits in `bonding_h`. Scanning the whole list per acceptor was
+    // the *dominant* quadratic term — gridding only the acceptor loop left the cost unchanged,
+    // which is what measuring rather than assuming turned up. Each hydrogen appears at most once
+    // (`used` guarantees it), so a plain index map suffices.
+    let mut slot_of: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(bonding_h.len());
+    for (slot, &j) in bonding_h.iter().enumerate() {
+        slot_of.insert(j, slot);
+    }
+    let mut near_h: Vec<usize> = Vec::new();
+    let mut near_acceptors: Vec<usize> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
     for &i in &acceptors {
-        for &j in &bonding_h {
+        // The hydrogens of `bonding_h` within reach of `i`, visited in their original
+        // `bonding_h` order so `pairs` comes out exactly as the full scan produced it.
+        hydrogen_grid.near(coords[i], &mut near_h);
+        slots.clear();
+        slots.extend(near_h.iter().filter_map(|j| slot_of.get(j).copied()));
+        slots.sort_unstable();
+        acceptor_grid.near(coords[i], &mut near_acceptors);
+        for &slot in &slots {
+            let j = bonding_h[slot];
             if (coords[i] - coords[j]).norm2() >= rah2 {
                 continue;
             }
-            for &k in &acceptors {
+            for &k in &near_acceptors {
                 if k == i {
                     continue;
                 }
@@ -239,11 +333,7 @@ fn build_hbonds(coords: &[Vec3], nat: &[u8]) -> Vec<HBond> {
                 if bangle(coords, k, j, i) <= PI * 0.5 {
                     continue;
                 }
-                // dedup: skip if (k,j,i) or (i,j,k) already present.
-                let dup = pairs
-                    .iter()
-                    .any(|&(p1, p2, p3)| p2 == j && ((p1 == k && p3 == i) || (p1 == i && p3 == k)));
-                if dup {
+                if !seen.insert((j, i.min(k), i.max(k))) {
                     continue;
                 }
                 pairs.push((i, j, k));
@@ -252,6 +342,16 @@ fn build_hbonds(coords: &[Vec3], nat: &[u8]) -> Vec<HBond> {
     }
 
     // setup_DH_Plus: for each pair, find neighbours of atom1 and atom5, reference atoms, flags.
+    //
+    // One grid over every atom, built once and shared. The neighbour search runs twice per
+    // candidate pair, so a full scan there was the dominant cost of the whole correction.
+    // The cell has to be at least the largest covalent-bond distance any pair in this molecule
+    // can have, so it is taken from the elements actually present rather than a global bound.
+    let max_bond = 2.0
+        * (0..numat)
+            .map(|j| covrad_scaled(nat[j]))
+            .fold(0.0_f64, f64::max);
+    let all_grid = CellGrid::new(coords, 0..numat, max_bond);
     let mut hbonds = Vec::with_capacity(pairs.len());
     for &(a1, h, a5) in &pairs {
         let mut s = [0usize; 9];
@@ -259,8 +359,8 @@ fn build_hbonds(coords: &[Vec3], nat: &[u8]) -> Vec<HBond> {
         s[4] = a5;
         s[8] = h;
 
-        let na = neighbours_capped(coords, nat, a1);
-        let nb = neighbours_capped(coords, nat, a5);
+        let na = neighbours_capped(coords, nat, a1, &all_grid);
+        let nb = neighbours_capped(coords, nat, a5, &all_grid);
         let nrbondsa = na.len();
         let nrbondsb = nb.len();
 
@@ -303,10 +403,16 @@ fn build_hbonds(coords: &[Vec3], nat: &[u8]) -> Vec<HBond> {
 
 /// Covalent neighbours of `atom`, capped at 4 (dropping the longest when a 5th appears), per
 /// `setup_DH_Plus`.
-fn neighbours_capped(coords: &[Vec3], nat: &[u8], atom: usize) -> Vec<usize> {
-    let numat = coords.len();
+///
+/// Candidates come from `grid` and are visited in ascending index order, which is what the full
+/// `0..numat` scan this replaces did — and the order matters, because the cap drops the longest
+/// bond only once a fifth arrives. This is called twice per candidate hydrogen bond, so the scan
+/// made it `O(P·N)`: measured, it was **90 %** of the whole correction and grew as `N^1.8`.
+fn neighbours_capped(coords: &[Vec3], nat: &[u8], atom: usize, grid: &CellGrid) -> Vec<usize> {
     let mut list: Vec<usize> = Vec::new();
-    for j in 0..numat {
+    let mut candidates: Vec<usize> = Vec::new();
+    grid.near(coords[atom], &mut candidates);
+    for j in candidates {
         if j != atom && distance(coords, j, atom) < bonding(nat, j, atom) {
             list.push(j);
             if list.len() == 5 {
@@ -345,7 +451,11 @@ fn assign_refs(
     if n == 3 || n == 4 {
         // three farthest-from-H neighbours, in descending order.
         let mut order = nb.to_vec();
-        order.sort_by(|&a, &b| dist_h(b).partial_cmp(&dist_h(a)).unwrap());
+        order.sort_by(|&a, &b| {
+            dist_h(b)
+                .partial_cmp(&dist_h(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         s[i2] = order[0];
         s[i3] = order[1];
         s[i4] = order[2];
@@ -669,17 +779,84 @@ fn distance_g<S: HbScalar>(c: &[[S; 3]], a: usize, b: usize) -> S {
     gnorm2(&gsub(c, a, b)).sqrt()
 }
 
-/// Generic twin of [`bangle`].
-fn bangle_g<S: HbScalar>(c: &[[S; 3]], i: usize, j: usize, k: usize) -> S {
+// There is no generic twin of [`bangle`], and that is the point: every EH+ use of the angle was
+// `bangle(..).cos()`, so the derivative path never needs the angle at all. Removing the round trip
+// left the function with no callers.
+
+/// `cos θ` at vertex `j` of `i-j-k`, **without ever forming `θ`**.
+///
+/// Every EH+ caller that wants a cosine currently writes `bangle(..).cos()`, and
+/// `cos(acos(t)) ≡ t` — so the round trip is the identity in exact arithmetic and a `0 × ∞` in
+/// forward-mode AD. `d(acos)/dt = −1/√(1−t²)` diverges at `t = ±1` while `d(cos)/dθ = −sin θ`
+/// vanishes there; the chain rule multiplies the two and gets the right answer only if nothing
+/// rounds. Near collinearity, with `δ` the angular distance from it, the gradient loses about
+/// `ε/δ²` and the second derivative about `ε/δ⁴`.
+///
+/// `t = −1` is a **straight D–H···A bond** — the ideal hydrogen-bond geometry, not a contrived
+/// one. Water wires, ice and symmetric dimers all sit on or beside it.
+///
+/// This is a removable singularity: the composition is smooth, only the parameterization is not.
+/// Returning `t` is exact, cheaper, and analytic wherever the geometry is, with nothing to tune.
+/// It is the same class of defect as the `(−1 + e^{−α²u})/u → −α²` limit in the 1-D Ewald log
+/// kernel, and admits the same kind of fix.
+fn bangle_cos_g<S: HbScalar>(c: &[[S; 3]], i: usize, j: usize, k: usize) -> S {
     let d2ij = gnorm2(&gsub(c, i, j));
     let d2jk = gnorm2(&gsub(c, j, k));
     let d2ik = gnorm2(&gsub(c, i, k));
     let xy = (d2ij * d2jk).sqrt();
     if xy.val() < 1.0e-20 {
+        // `bangle` returns 0 here, whose cosine is 1.
+        return S::cst(1.0);
+    }
+    ((d2ij + d2jk - d2ik) * 0.5 / xy).clamp2(-1.0, 1.0)
+}
+
+/// `sin θ` at vertex `j` of `i-j-k`, from the cross product rather than from `√(1 − cos²θ)`.
+///
+/// The two agree to rounding away from collinearity. At it they do not: `√(1 − t²)` differentiates
+/// to `−t/√(1−t²) · dt`, and `dt` vanishes to the same order, so the ratio is another `0/0` with
+/// the true — finite — limit hidden inside it. `|r_ji × r_jk| / (|r_ji| |r_jk|)` computes the same
+/// number as the norm of a vector that vanishes linearly in the transverse offset, so its
+/// derivative is bounded and simply one-sided.
+///
+/// That last part is the honest limit of what a reformulation can buy. `sin θ` really is
+/// `|·|`-shaped at collinearity — the *model* has a corner there, not just the formula — so the
+/// gradient stays direction-discontinuous however it is computed. What changes is that the value
+/// is now the correct one-sided derivative instead of catastrophic cancellation, and the second
+/// derivative is bounded instead of `ε/δ⁴`.
+fn bangle_sin_g<S: HbScalar>(c: &[[S; 3]], i: usize, j: usize, k: usize) -> S {
+    let u = gsub(c, i, j);
+    let v = gsub(c, k, j);
+    let cross = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let denominator = (gnorm2(&u) * gnorm2(&v)).sqrt();
+    if denominator.val() < 1.0e-20 {
         return S::cst(0.0);
     }
-    let temp = ((d2ij + d2jk - d2ik) * 0.5 / xy).clamp2(-1.0, 1.0);
-    temp.acos()
+    let n2 = gnorm2(&cross);
+    if n2.val() < 1.0e-40 {
+        // Exactly collinear. The one-sided derivative is a direction the geometry no longer
+        // carries, so there is nothing better than zero to return, and `√` of it would be a NaN.
+        return S::cst(0.0);
+    }
+    n2.sqrt() / denominator
+}
+
+/// `cos(shift − θ)` where `θ` is the angle at vertex `j` of `i-j-k`.
+///
+/// Expanded with the addition formula so that neither `acos` nor `√(1 − cos²)` appears. When
+/// `shift` is a multiple of `π` — the O-with-one-bond case — the `sin` term drops out entirely and
+/// the result is `±cos θ`, analytic everywhere.
+fn shifted_angle_cos_g<S: HbScalar>(c: &[[S; 3]], i: usize, j: usize, k: usize, shift: S) -> S {
+    let cos_theta = bangle_cos_g(c, i, j, k);
+    let sin_shift = (shift * -1.0 + std::f64::consts::FRAC_PI_2).cos();
+    if sin_shift.val().abs() < 1.0e-15 {
+        return shift.cos() * cos_theta;
+    }
+    shift.cos() * cos_theta + sin_shift * bangle_sin_g(c, i, j, k)
 }
 
 /// Generic twin of [`dang`].
@@ -840,9 +1017,12 @@ fn side_terms_g<S: HbScalar>(
         torsion_check = tc_bac;
     }
 
-    let angle2 = bangle_g(coords, r1, heavy, h);
-    let mut angle2_cos = (angle2_shift - angle2).cos();
-    let angle2_cos_2 = (angle2_shift_2 - angle2).cos();
+    // `cos(shift − θ)` straight from the geometry. Writing it as `(shift − bangle_g(..)).cos()`,
+    // the way the f64 port does to stay bit-faithful to MOPAC, puts an `acos` and a `cos` back to
+    // back and makes the chain rule evaluate `0 × ∞` at a collinear R–X···H — see
+    // [`bangle_cos_g`].
+    let mut angle2_cos = shifted_angle_cos_g(coords, r1, heavy, h, angle2_shift);
+    let angle2_cos_2 = shifted_angle_cos_g(coords, r1, heavy, h, angle2_shift_2);
     if angle2_cos_2.val() > angle2_cos.val() {
         angle2_cos = angle2_cos_2;
     }
@@ -910,7 +1090,10 @@ fn eh_plus_g<S: HbScalar>(coords: &[[S; 3]], hb: &HBond, nat: &[u8]) -> S {
     let s8 = hb.s[7];
     let h = hb.s[8];
 
-    let angle_cos = -bangle_g(coords, s1, h, s5).cos();
+    // `−cos(π − θ_D–H···A)`, without the `acos`/`cos` round trip the f64 port keeps for MOPAC
+    // fidelity. A straight hydrogen bond is `θ = π`, which is exactly where that round trip
+    // differentiates as `0 × ∞`; see [`bangle_cos_g`].
+    let angle_cos = -bangle_cos_g(coords, s1, h, s5);
     if angle_cos.val() <= 0.0 {
         return S::cst(0.0);
     }
@@ -998,101 +1181,180 @@ fn atomic_numbers(molecule: &Molecule) -> Vec<u8> {
     molecule.atoms.iter().map(|a| a.z).collect()
 }
 
-/// Total PM7 hydrogen-bond correction energy (kcal/mol).
+/// How far beyond the cell periodic images must reach for the H-bond perception to be complete.
+///
+/// The longest span inside one EH+ bond is hydrogen → acceptor (`LONGCUT`, 7 Å) plus the
+/// acceptor's own covalent neighbour (~2 Å). 10 Å therefore covers every atom any bond can
+/// reach, with margin. Making the cluster larger changes nothing; making it smaller would start
+/// dropping bonds, which is why this is a named constant rather than a tuned number.
+const IMAGE_REACH_ANGSTROM: f64 = 12.0;
+
+/// The central cell's atoms followed by every periodic image within reach of them.
+///
+/// This is how the many-body EH+ term goes periodic without touching any of its geometry: the
+/// bond perception, the angles, the torsions, and the `Dual2N<27>` Hessian all run unchanged on
+/// an **unwrapped** cluster, and only the bookkeeping at the edges — which bonds to keep, and
+/// which central atom each image belongs to — is new. Wrapping coordinates into the cell
+/// instead would tear bonds apart at the cell face.
+struct ExtendedCluster {
+    /// Ångström, central-cell atoms first.
+    coords: Vec<Vec3>,
+    nat: Vec<u8>,
+    /// Central-cell atom that each entry is an image of.
+    parent: Vec<usize>,
+    /// Lattice translation each entry is displaced by, `[0, 0, 0]` for the central cell.
+    ///
+    /// A Γ-point force constant folds every image onto its parent and needs nothing more; a
+    /// finite-`q` dynamical matrix needs `e^{iq·T}` per image, which is what this carries.
+    translation: Vec<[i32; 3]>,
+    /// Number of leading entries that are the central cell itself.
+    n_central: usize,
+}
+
+impl ExtendedCluster {
+    fn build(molecule: &Molecule) -> Self {
+        let _stage = crate::profile::stage("hbond: cluster build");
+        let coords = coords_angstrom(molecule);
+        let nat = atomic_numbers(molecule);
+        let n_central = coords.len();
+        let parent: Vec<usize> = (0..n_central).collect();
+        let mut out = Self {
+            coords,
+            nat,
+            parent,
+            translation: vec![[0, 0, 0]; n_central],
+            n_central,
+        };
+        let Some(cell) = molecule.cell else {
+            return out;
+        };
+        let reach = IMAGE_REACH_ANGSTROM * crate::constants::ANGSTROM_TO_BOHR;
+        let images = cell.image_indices(reach, cell_span(&cell));
+        let central: Vec<Vec3> = molecule.atoms.iter().map(|a| a.position).collect();
+        // "Within reach of some central atom" was a full scan of the central cell for every image
+        // of every atom — `O(n_img · N²)`. The grid answers the same question in `O(1)`, making
+        // the cluster build `O(n_img · N)`. Only the *existence* of a nearby atom is asked, and
+        // the images are appended in the same `(translation, atom)` order as before, so the
+        // cluster is identical.
+        let central_grid = CellGrid::new(&central, 0..central.len(), reach);
+        let mut candidates: Vec<usize> = Vec::new();
+        for t in images {
+            if t == [0, 0, 0] {
+                continue;
+            }
+            let shift = cell.translation(t);
+            for (ia, base) in central.iter().enumerate() {
+                let p = *base + shift;
+                central_grid.near(p, &mut candidates);
+                if candidates.iter().any(|&c| (p - central[c]).norm() <= reach) {
+                    out.coords.push(p * PM7_A0);
+                    out.nat.push(molecule.atoms[ia].z);
+                    out.parent.push(ia);
+                    out.translation.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// The perceived hydrogen bonds owned by this cell: those whose bridging hydrogen
+    /// (`s[8]`) is a central-cell atom. Every bond of the infinite crystal is owned by exactly
+    /// one cell, so this counts each one once per cell and no more.
+    fn owned_bonds(&self) -> Vec<HBond> {
+        build_hbonds(&self.coords, &self.nat)
+            .into_iter()
+            .filter(|hb| !hb.disabled && hb.s[8] < self.n_central)
+            .collect()
+    }
+}
+
+/// Longest diagonal of a cell, the largest separation two atoms inside it can have.
+fn cell_span(cell: &crate::cell::Cell) -> f64 {
+    let v = cell.vectors();
+    let dim = v.len();
+    let mut worst = 0.0_f64;
+    for mask in 0..(1usize << dim) {
+        let mut corner = Vec3::zero();
+        for (k, a) in v.iter().enumerate() {
+            if mask & (1 << k) != 0 {
+                corner += *a;
+            }
+        }
+        worst = worst.max(corner.norm());
+    }
+    worst
+}
+
+/// Total PM7 hydrogen-bond correction energy (kcal/mol), per unit cell for a periodic system.
+///
+/// Parallel over hydrogen bonds, like the gradient and the Hessian in this file already are — the
+/// energy was the one path left serial. Each bond's `eh_plus` is independent and the results are
+/// collected **in bond order** before summing, so the total is bit-identical to the serial sum and
+/// independent of the thread count (`tests/determinism.rs`).
 pub fn hydrogen_bond_energy(molecule: &Molecule) -> f64 {
-    let coords = coords_angstrom(molecule);
-    let nat = atomic_numbers(molecule);
-    let hbonds = build_hbonds(&coords, &nat);
-    hbonds.iter().map(|hb| eh_plus(&coords, hb, &nat)).sum()
-}
-
-/// Sum EH+ over a fixed H-bond list at the given (Ångström) coordinates.
-/// For each atom, the indices of the (non-disabled) hydrogen bonds it participates in. Used to
-/// restrict the finite-difference gradient/Hessian to the H-bonds actually affected by moving an
-/// atom, turning the naive O(N_atoms · N_hbonds) sweep into O(Σ hbond sizes).
-fn atom_to_hbonds(hbonds: &[HBond], n: usize) -> Vec<Vec<usize>> {
-    let mut map: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (hi, hb) in hbonds.iter().enumerate() {
-        if hb.disabled {
-            continue;
-        }
-        let mut seen: [usize; 9] = hb.s;
-        seen.sort_unstable();
-        let mut last = usize::MAX;
-        for &a in &seen {
-            if a != last {
-                map[a].push(hi);
-                last = a;
-            }
-        }
-    }
-    map
-}
-
-/// PM7 hydrogen-bond correction gradient, in **kcal/mol per Bohr** (the caller multiplies by
-/// `KCAL_TO_EV` to reach eV/Bohr, matching the dispersion path). Central finite difference of the
-/// energy at fixed H-bond topology.
-#[allow(dead_code)]
-fn hydrogen_bond_gradient_fd(molecule: &Molecule) -> Vec<Vec3> {
     use rayon::prelude::*;
-    let n = molecule.atoms.len();
-    let coords0 = coords_angstrom(molecule);
-    let nat = atomic_numbers(molecule);
-    let hbonds = build_hbonds(&coords0, &nat);
-    if hbonds.is_empty() {
-        return vec![Vec3::zero(); n];
+    let ext = ExtendedCluster::build(molecule);
+    let sum = |bonds: &[HBond]| -> f64 {
+        let _t = crate::profile::stage("hbond: eh_plus sum");
+        // Below a few bonds the pool hand-off costs more than the work; `eh_plus` is a handful of
+        // angles and dampings per bond, not a matrix operation.
+        if bonds.len() < 32 {
+            return bonds
+                .iter()
+                .map(|hb| eh_plus(&ext.coords, hb, &ext.nat))
+                .sum();
+        }
+        let terms: Vec<f64> = bonds
+            .par_iter()
+            .map(|hb| eh_plus(&ext.coords, hb, &ext.nat))
+            .collect();
+        terms.iter().sum()
+    };
+    if molecule.cell.is_none() {
+        // Preserve the molecular path exactly, including bonds flagged `disabled` (which
+        // `eh_plus` itself zeroes) and the original ordering of the sum.
+        return sum(&build_hbonds(&ext.coords, &ext.nat));
     }
-    let atom_hb = atom_to_hbonds(&hbonds, n);
-    let delta = 1.0e-4; // Å
-                        // Each atom's 3 gradient components are independent; only the H-bonds involving that atom
-                        // depend on it, so the perturbed sum runs over `atom_hb[a]` alone. Parallel over atoms, each
-                        // task holding its own perturbed coordinate copy (race-free).
-    (0..n)
-        .into_par_iter()
-        .map(|a| {
-            let mut g = Vec3::zero();
-            if atom_hb[a].is_empty() {
-                return g;
-            }
-            let mut coords = coords0.clone();
-            for c in 0..3 {
-                let orig = component(coords[a], c);
-                set_component(&mut coords[a], c, orig + delta);
-                let ep: f64 = atom_hb[a]
-                    .iter()
-                    .map(|&hi| eh_plus(&coords, &hbonds[hi], &nat))
-                    .sum();
-                set_component(&mut coords[a], c, orig - delta);
-                let em: f64 = atom_hb[a]
-                    .iter()
-                    .map(|&hi| eh_plus(&coords, &hbonds[hi], &nat))
-                    .sum();
-                set_component(&mut coords[a], c, orig);
-                set_component(&mut g, c, (ep - em) / (2.0 * delta) * PM7_A0);
-            }
-            g
-        })
-        .collect()
+    sum(&ext.owned_bonds())
 }
 
 /// Analytic PM7 hydrogen-bond correction gradient in kcal/mol per Bohr. The generic EH+
 /// expression is evaluated once per participating atom with x/y/z seeded as first-order duals.
 pub fn hydrogen_bond_gradient(molecule: &Molecule) -> Vec<Vec3> {
+    hydrogen_bond_gradient_and_virial(molecule).0
+}
+
+/// The H-bond gradient (kcal/mol per Bohr) together with its virial (kcal/mol), the latter in
+/// the Ångström-free form `Σ_i (∂E/∂r_i) ⊗ r_i` over the **unwrapped** cluster coordinates.
+///
+/// EH+ depends only on relative positions, so that sum is origin-independent and is the exact
+/// strain derivative even though the term is many-body rather than pairwise.
+pub fn hydrogen_bond_gradient_and_virial(molecule: &Molecule) -> (Vec<Vec3>, crate::math::Mat3) {
     use rayon::prelude::*;
     let n = molecule.atoms.len();
-    let coords0 = coords_angstrom(molecule);
-    let nat = atomic_numbers(molecule);
-    let hbonds = build_hbonds(&coords0, &nat);
+    let ext = ExtendedCluster::build(molecule);
+    let periodic = molecule.cell.is_some();
+    let hbonds: Vec<HBond> = if periodic {
+        ext.owned_bonds()
+    } else {
+        build_hbonds(&ext.coords, &ext.nat)
+            .into_iter()
+            .filter(|hb| !hb.disabled)
+            .collect()
+    };
     let contributions: Vec<(usize, Vec3)> = hbonds
         .par_iter()
-        .filter(|hb| !hb.disabled)
-        .flat_map_iter(|hb| hbond_gradient_block(hb, &coords0, &nat))
+        .flat_map_iter(|hb| hbond_gradient_block(hb, &ext.coords, &ext.nat))
         .collect();
     let mut gradient = vec![Vec3::zero(); n];
-    for (atom, value) in contributions {
-        gradient[atom] += value;
+    let mut virial = crate::math::Mat3::zero();
+    for (index, value) in contributions {
+        // Fold each image's force onto the central atom it is an image of.
+        gradient[ext.parent[index]] += value;
+        // The virial uses the *unwrapped* position, in Bohr to match the gradient's units.
+        virial = virial.plus(&crate::math::Mat3::outer(value, ext.coords[index] / PM7_A0));
     }
-    gradient
+    (gradient, virial)
 }
 
 fn hbond_gradient_block(hb: &HBond, coords0: &[Vec3], nat: &[u8]) -> Vec<(usize, Vec3)> {
@@ -1147,11 +1409,22 @@ fn hbond_gradient_block(hb: &HBond, coords0: &[Vec3], nat: &[u8]) -> Vec<(usize,
 /// of stack, *independent of system size*), and the only heap growth is the `(row, col, value)`
 /// triples (≤ 27² per bond). Nothing is ever materialised at O(N_atoms²), so a large molecule with
 /// a handful of H-bonds costs the same per bond as a small one. Work is parallel over bonds.
+/// For a periodic system this is the **q = 0** (Γ) force-constant contribution: an image's
+/// second derivative is folded onto the central atom it belongs to, which is exactly the
+/// `Σ_T Φ(0, T)` a Γ-point phonon needs. A finite-`q` dynamical matrix additionally needs the
+/// `e^{iq·T}` phase of each image, which is why the translation index is kept on the cluster.
 pub fn add_hbond_hessian(molecule: &Molecule, hess: &mut crate::linalg::Matrix) {
     use rayon::prelude::*;
-    let coords0 = coords_angstrom(molecule);
-    let nat = atomic_numbers(molecule);
-    let hbonds = build_hbonds(&coords0, &nat);
+    let ext = ExtendedCluster::build(molecule);
+    let periodic = molecule.cell.is_some();
+    let hbonds: Vec<HBond> = if periodic {
+        ext.owned_bonds()
+    } else {
+        build_hbonds(&ext.coords, &ext.nat)
+            .into_iter()
+            .filter(|hb| !hb.disabled)
+            .collect()
+    };
     if hbonds.is_empty() {
         return;
     }
@@ -1163,12 +1436,56 @@ pub fn add_hbond_hessian(molecule: &Molecule, hess: &mut crate::linalg::Matrix) 
     let contribs: Vec<(usize, usize, f64)> = hbond_pool().install(|| {
         hbonds
             .par_iter()
-            .filter(|hb| !hb.disabled)
-            .flat_map_iter(|hb| hbond_hessian_block(hb, &coords0, &nat, unit))
+            .flat_map_iter(|hb| hbond_hessian_block(hb, &ext.coords, &ext.nat, unit))
+            .collect()
+    });
+    // Map cluster degrees of freedom back to the central cell's.
+    let fold = |dof: usize| 3 * ext.parent[dof / 3] + dof % 3;
+    for (row, col, v) in contribs {
+        hess[(fold(row), fold(col))] += v;
+    }
+}
+
+/// The EH+ contribution to a dynamical matrix at wavevector `q`.
+///
+/// Same blocks as [`add_hbond_hessian`], scattered with `e^{iq·(T_col − T_row)}` instead of being
+/// folded unphased onto the parent atoms. At `q = 0` every phase is 1 and this reduces to
+/// `add_hbond_hessian` exactly, which is what `tests/dfpt.rs` checks.
+///
+/// The phase depends on the **difference** of the two cluster entries' translations, not on either
+/// alone: a force constant `Φ(0A, TB)` is a property of the separation, and writing the row's own
+/// phase in as well would make `D(q)` origin-dependent and non-Hermitian.
+pub fn add_hbond_hessian_phased(
+    molecule: &Molecule,
+    cell: &crate::cell::Cell,
+    q_cart: Vec3,
+    out: &mut crate::cmatrix::CMatrix,
+) {
+    use rayon::prelude::*;
+    let ext = ExtendedCluster::build(molecule);
+    let hbonds: Vec<HBond> = ext.owned_bonds();
+    if hbonds.is_empty() {
+        return;
+    }
+    let unit = PM7_A0 * PM7_A0 * KCAL_TO_EV;
+    let contribs: Vec<(usize, usize, f64)> = hbond_pool().install(|| {
+        hbonds
+            .par_iter()
+            .flat_map_iter(|hb| hbond_hessian_block(hb, &ext.coords, &ext.nat, unit))
             .collect()
     });
     for (row, col, v) in contribs {
-        hess[(row, col)] += v;
+        let (ra, ca) = (row / 3, col / 3);
+        let shift = [
+            ext.translation[ca][0] - ext.translation[ra][0],
+            ext.translation[ca][1] - ext.translation[ra][1],
+            ext.translation[ca][2] - ext.translation[ra][2],
+        ];
+        let angle = q_cart.dot(cell.translation(shift));
+        let (cos, sin) = (angle.cos(), angle.sin());
+        let (r, c) = (3 * ext.parent[ra] + row % 3, 3 * ext.parent[ca] + col % 3);
+        let (re, im) = out.get(r, c);
+        out.set(r, c, re + v * cos, im + v * sin);
     }
 }
 
@@ -1240,6 +1557,9 @@ fn hbond_hessian_block(
     out
 }
 
+// Only the finite-difference reference in this module's tests reaches for a Cartesian component
+// by index; the shipping paths all use `Dual`/`Dual2N` and never index a `Vec3` dynamically.
+#[cfg(test)]
 #[inline]
 fn component(v: Vec3, i: usize) -> f64 {
     match i {
@@ -1249,6 +1569,7 @@ fn component(v: Vec3, i: usize) -> f64 {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn set_component(v: &mut Vec3, i: usize, val: f64) {
     match i {
@@ -1301,6 +1622,90 @@ mod tests {
             }
         }
         assert!(active >= 1, "expected an attractive (non-zero) H-bond term");
+    }
+
+    /// A water dimer whose O–H···O is straight to within `tilt` radians.
+    ///
+    /// The donor H sits on the O···O axis when `tilt = 0`, which is both the ideal hydrogen-bond
+    /// geometry and the point where the EH+ angle term is parameterized in a singular coordinate.
+    fn linear_water_dimer(tilt: f64) -> (Vec<Vec3>, Vec<u8>) {
+        let oo = 2.86;
+        let oh = 0.96;
+        let coords = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(oh * tilt.cos(), oh * tilt.sin(), 0.0),
+            Vec3::new(-0.24, -0.93, 0.0),
+            Vec3::new(oo, 0.0, 0.0),
+            Vec3::new(oo + 0.34, 0.90, 0.0),
+            Vec3::new(oo + 0.34, -0.45, 0.78),
+        ];
+        (coords, vec![8, 1, 1, 8, 1, 1])
+    }
+
+    /// The EH+ gradient must stay finite and correct as the hydrogen bond straightens.
+    ///
+    /// `θ_D–H···A = π` is the *ideal* geometry, and it is exactly where writing the angle term as
+    /// `cos(acos(t))` makes the chain rule evaluate `0 × ∞`. The composition is the identity, so
+    /// the energy is unharmed and only the derivatives rot — quietly, and worse the closer the bond
+    /// is to the geometry the correction exists to reward. Computing `cos θ` directly removes it;
+    /// there is nothing to tune and no window to fall outside of.
+    ///
+    /// The tilts here span four decades. Before the fix the error grew like `ε/δ²`; after it the
+    /// only error left is the finite difference's own.
+    #[test]
+    fn the_hydrogen_bond_gradient_survives_a_straight_bond() {
+        for tilt in [1.0e-1_f64, 1.0e-2, 1.0e-3, 1.0e-4, 1.0e-5, 0.0] {
+            let (coords, nat) = linear_water_dimer(tilt);
+            let molecule = Molecule::new(
+                coords
+                    .iter()
+                    .zip(&nat)
+                    .map(|(p, z)| crate::system::Atom {
+                        z: *z,
+                        position: *p * crate::constants::ANGSTROM_TO_BOHR,
+                    })
+                    .collect(),
+            );
+            let analytic = hydrogen_bond_gradient(&molecule);
+            assert!(
+                analytic
+                    .iter()
+                    .all(|g| g.x.is_finite() && g.y.is_finite() && g.z.is_finite()),
+                "tilt {tilt:.0e}: the EH+ gradient is not finite: {analytic:?}"
+            );
+
+            // Independent reference: a central difference of the energy, which never forms an
+            // angle at all.
+            let h = 1.0e-5 * crate::constants::ANGSTROM_TO_BOHR;
+            let mut worst = 0.0_f64;
+            let mut scale = 1.0_f64;
+            for atom in 0..molecule.atoms.len() {
+                for axis in 0..3 {
+                    let shifted = |s: f64| {
+                        let mut m = molecule.clone();
+                        match axis {
+                            0 => m.atoms[atom].position.x += s * h,
+                            1 => m.atoms[atom].position.y += s * h,
+                            _ => m.atoms[atom].position.z += s * h,
+                        }
+                        hydrogen_bond_energy(&m)
+                    };
+                    let fd = (shifted(1.0) - shifted(-1.0)) / (2.0 * h);
+                    let mine = match axis {
+                        0 => analytic[atom].x,
+                        1 => analytic[atom].y,
+                        _ => analytic[atom].z,
+                    };
+                    scale = scale.max(fd.abs());
+                    worst = worst.max((mine - fd).abs());
+                }
+            }
+            assert!(
+                worst < 1.0e-4 * scale,
+                "tilt {tilt:.0e}: the EH+ gradient differs from a finite difference by \
+                 {worst:.3e} (values up to {scale:.3e})"
+            );
+        }
     }
 
     /// The analytic `Dual2N<27>` local Hessian of a single bond must match an independent

@@ -84,6 +84,18 @@ impl Pm7Element {
             self.rho0
         }
     }
+
+    /// MOPAC `ddp(5)`: the **p–d** dipole charge separation in Bohr, the p–d analogue of
+    /// [`Self::dd`]. Zero for an element with no d shell.
+    ///
+    /// This applies to main-group d elements too. `mndod.rs`'s `main_group` override rewrites
+    /// only `ddp[2]` and `ddp[3]`, leaving `ddp[5]` at its `ddpo` value exactly as MOPAC's `inid`
+    /// does — so S, P and Cl carry a p–d dipole term, which reads as surprising if you assume the
+    /// override suppresses everything d-shaped.
+    #[inline]
+    pub fn ddp_pd(&self) -> f64 {
+        self.dshell.as_ref().map_or(0.0, |d| d.ddp[5])
+    }
 }
 
 /// PM7 pair-specific core-core scaling parameters.
@@ -109,7 +121,40 @@ impl Pm7Parameters {
     }
 
     /// Load a PM7 family method while preserving the common NDDO API.
+    ///
+    /// The tables are parsed once per method and cloned afterwards. Parsing them is a thousand-odd
+    /// rows of CSV and two hash maps' worth of insertions, which is nothing next to an SCF but is
+    /// not nothing next to a *water* SCF — and a molecular-dynamics run or a geometry scan pays it
+    /// on every step. [`shared`](Self::shared) hands back the cached copy directly for callers that
+    /// can hold a reference.
     pub fn method(method: Pm7Method) -> Result<Self> {
+        Self::shared(method).cloned()
+    }
+
+    /// The cached parameter set for a method, parsed at most once per process.
+    ///
+    /// A parse failure is cached too, and deliberately: the tables are compiled in with
+    /// `include_str!`, so if they do not parse they will not parse on the next call either, and
+    /// retrying would only convert a deterministic error into a slow deterministic error.
+    pub fn shared(method: Pm7Method) -> Result<&'static Self> {
+        // One slot per `Pm7Method` variant, indexed by `slot()` — an array rather than a map so
+        // the fast path is a bounds-checked index and an atomic load.
+        static CACHE: [std::sync::OnceLock<std::result::Result<Pm7Parameters, String>>; 5] =
+            [const { std::sync::OnceLock::new() }; 5];
+        let slot = match method {
+            Pm7Method::Pm7 => 0,
+            Pm7Method::Pm7Ts => 1,
+            Pm7Method::Pm7Sparkle => 2,
+            Pm7Method::Pm7Minus => 3,
+            Pm7Method::Pm7Hh => 4,
+        };
+        match CACHE[slot].get_or_init(|| Self::parse(method).map_err(|e| e.to_string())) {
+            Ok(parameters) => Ok(parameters),
+            Err(message) => Err(Pm7Error::InvalidInput(message.clone())),
+        }
+    }
+
+    fn parse(method: Pm7Method) -> Result<Self> {
         let (elements, pairs, vpar) = match method {
             Pm7Method::Pm7Ts => (
                 data_tables::PM7_TS_ELEMENTS_CSV,
@@ -386,6 +431,29 @@ impl Pm7Parameters {
         })
     }
 
+    /// The elements `PM7 SPARKLE` replaces with a `+3` point core, from MOPAC `switch.F90:120-131`:
+    ///
+    /// ```text
+    /// if (index(keywrd, " SPARK") /= 0 .or. method_pm3 .or. method_am1) then
+    ///   sparkle_min = 57;  sparkle_max = 71     ! La .. Lu
+    /// else if (method_rm1) then
+    ///   sparkle_min = 0;   sparkle_max = 0
+    /// else
+    ///   sparkle_min = 58;  sparkle_max = 70     ! Ce .. Yb
+    /// end if
+    /// ```
+    ///
+    /// `install_sparkles` runs only for [`crate::Pm7Method::Pm7Sparkle`], which *is* MOPAC's
+    /// `PM7 SPARKLE`, so the first branch applies. Through v0.2.2 this crate used `58..=70` — the
+    /// **`else`** branch, the range PM7 uses when `SPARKLE` was *not* given — in both places it is
+    /// needed, so La and Lu silently stayed full nine-orbital PM7 atoms under a method that had
+    /// promised to make them point charges.
+    ///
+    /// The two endpoints were the only lanthanides that disagreed with MOPAC, and they disagreed
+    /// by 195.3 and 161.2 kcal/mol against 1e-4 for the other thirteen. `tools/oracle/sparkles.py`
+    /// is the sweep that found it; nothing in the suite covered La or Lu before.
+    const SPARKLE_Z: std::ops::RangeInclusive<u8> = 57..=71;
+
     fn install_sparkles(&mut self, text: &str) -> Result<()> {
         // MOPAC `eheat_sparkles` (kcal/mol) — the Ln(III) reference heats used for
         // the sparkle heat of formation (parameters_C.F90).
@@ -409,7 +477,7 @@ impl Pm7Parameters {
         let (header, rows) = csv_rows(text)?;
         for row in rows {
             let z = get_u8(&row, column(&header, "z")?, "z")?;
-            if !(58..=70).contains(&z) {
+            if !Self::SPARKLE_Z.contains(&z) {
                 continue;
             }
             let eheat_kcal = EHEAT_SPARKLE
@@ -472,17 +540,16 @@ impl Pm7Parameters {
                 },
             );
         }
-        // MOPAC `switch.F90` (PM7 branch, lines 472-475): after the sparkle
-        // parameters are installed, the whole `alpb`/`xfac` rows *and* columns for
-        // the sparkle range are zeroed, so a lanthanide never carries the diatomic
-        // core-core scaling it would have as a full PM7 atom.  We drop those pair
-        // entries (rather than store zeros) so `pair` re-completes them as
-        // `0.5*(0 + X-X)` — exactly what MOPAC ccrep does with a zeroed pair.
-        // Otherwise the real Gd-F (64,9) / Gd-Gd (64,64) entries survive and make
-        // GdF3 core-core ~0.14 eV/bond too repulsive (a Gd-specific +0.57 eV / +13
-        // kcal/mol error absent from the other lanthanides, which lack such entries).
+        // MOPAC `switch.F90:471-475`: after the sparkle parameters are installed, the whole
+        // `alpb`/`xfac` rows *and* columns for the sparkle range are zeroed, so a lanthanide never
+        // carries the diatomic core-core scaling it would have as a full PM7 atom.  We drop those
+        // pair entries (rather than store zeros) so `pair` re-completes them as `0.5*(0 + X-X)` —
+        // exactly what MOPAC ccrep does with a zeroed pair.  Otherwise the real Gd-F (64,9) /
+        // Gd-Gd (64,64) entries survive and make GdF3 core-core ~0.14 eV/bond too repulsive.
+        //
+        // The same [`Self::SPARKLE_Z`] MOPAC zeroes over, for the same reason it does.
         self.pairs
-            .retain(|&(a, b), _| !(58..=70).contains(&a) && !(58..=70).contains(&b));
+            .retain(|&(a, b), _| !Self::SPARKLE_Z.contains(&a) && !Self::SPARKLE_Z.contains(&b));
         Ok(())
     }
 }

@@ -1,21 +1,88 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
+requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "pm7-rs-python"
-version = "0.1.2"
-description = "PM7 semiempirical NDDO method (pm7-rs) with Python-native and ASE APIs"
+# The version comes from Cargo.toml via maturin, so it lives in exactly one place. Bumping it
+# here as well would create a second copy to forget.
+dynamic = ["version"]
+description = "PM7 semiempirical NDDO method (pm7-rs) with periodic boundary conditions, analytic gradients and stress, and Python and ASE APIs"
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
-requires-python = ">=3.9"
+# PEP 639: an SPDX expression plus the files it refers to. The older
+# `license = { text = "..." }` table is deprecated and produces a warning on modern tooling.
+license = "GPL-3.0-or-later"
+# `third_party/mopac/LICENSE` is not optional. The wheel ships `_native.pyd`, which embeds the
+# MOPAC-derived PM7 parameter tables through `include_str!`, so distributing it distributes
+# Apache-2.0 material -- and section 4(a) requires giving every recipient a copy of the License,
+# section 4(b) requires retaining the attribution notices. Listing it here puts both inside the
+# wheel's `dist-info/licenses/`, where a recipient actually finds them. `tests/attribution.rs`
+# keeps this list honest.
+#
+# `third_party/rust/NOTICES.md` is the same obligation one layer up: `_native.pyd` is statically
+# linked, so it is a copy of a substantial portion of ~120 MIT/Apache-2.0 crates, each of which
+# requires its notice to travel with the copy.
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/mopac/LICENSE",
+    "third_party/rust/NOTICES.md",
+]
+requires-python = ">=3.10"
 authors = [{ name = "ss0832" }]
+keywords = [
+    "chemistry",
+    "quantum-chemistry",
+    "semiempirical",
+    "pm7",
+    "mopac",
+    "nddo",
+    "periodic-boundary-conditions",
+    "ase",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = ["numpy>=1.21"]
 
 [project.optional-dependencies]
 ase = ["ase>=3.22"]
 
+[project.urls]
+Homepage = "https://github.com/ss0832/pm7-rs"
+Repository = "https://github.com/ss0832/pm7-rs"
+Documentation = "https://docs.rs/pm7-rs"
+Changelog = "https://github.com/ss0832/pm7-rs/blob/main/CHANGELOG.md"
+Issues = "https://github.com/ss0832/pm7-rs/issues"
+
+[project.scripts]
+# The Rust `pm7_rs_cli` binary is not part of the wheel, so the console script routes through
+# the extension module instead -- `pm7-rs` and `python -m pm7_rs` do the same thing.
+pm7-rs = "pm7_rs.__main__:main"
+
 [tool.maturin]
 features = ["python"]
 python-source = "python"
 module-name = "pm7_rs._native"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+# `matrix` is the full CLI cross-product in `python/tests/test_cli_matrix.py`: a few thousand
+# interpreter starts, minutes to run, and deselected by default. `pytest -m matrix` runs it.
+# Registered here so that an unmarked run does not warn about an unknown marker -- and so that a
+# typo in the marker name is an error rather than a test that silently never runs.
+markers = [
+    "matrix: the full CLI flag cross-product; slow, run with `pytest -m matrix`",
+]
+addopts = "-m 'not matrix'"

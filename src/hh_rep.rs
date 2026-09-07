@@ -13,7 +13,7 @@
 
 use crate::constants::PM7_A0;
 use crate::dual::{Dual, Scalar};
-use crate::math::Vec3;
+use crate::math::{Mat3, Vec3};
 use crate::system::Molecule;
 
 /// MOPAC `poly`: the H–H repulsion for two hydrogens separated by `r` Å (kcal/mol),
@@ -35,49 +35,60 @@ pub fn poly_scalar<S: Scalar>(r_ang: S) -> S {
     }
 }
 
-/// Total PM7-HH H–H repulsion energy (kcal/mol).
+/// Total PM7-HH H–H repulsion energy (kcal/mol), over every H–H pair of a molecule.
 pub fn hh_repulsion_energy(molecule: &Molecule) -> f64 {
-    let n = molecule.atoms.len();
-    let mut e = 0.0;
-    for i in 0..n {
-        if molecule.atoms[i].z != 1 {
-            continue;
-        }
-        for j in 0..i {
-            if molecule.atoms[j].z != 1 {
-                continue;
-            }
-            let r = (molecule.atoms[i].position - molecule.atoms[j].position).norm() * PM7_A0;
-            e += poly_scalar::<f64>(r);
-        }
-    }
-    e
+    hh_repulsion_energy_cut(molecule, f64::INFINITY)
+}
+
+/// H–H repulsion with an explicit image cutoff (Bohr), per unit cell for a periodic system.
+///
+/// The term is very short ranged — the exponential tail is already below 1e-6 kcal/mol past
+/// about 5 Å — so any sane cutoff is exact in practice. It is still summed over images, because
+/// a hydrogen near a cell face is genuinely close to its neighbour's image.
+pub fn hh_repulsion_energy_cut(molecule: &Molecule, cutoff: f64) -> f64 {
+    let list = crate::pbc::PairList::cached(molecule, cutoff);
+    let r_on = crate::pbc::taper_onset(cutoff);
+    list.pairs
+        .iter()
+        .filter(|p| molecule.atoms[p.a].z == 1 && molecule.atoms[p.b].z == 1)
+        .map(|p| {
+            let (w, _) = crate::pbc::taper(p.r, r_on, cutoff);
+            p.weight * w * poly_scalar::<f64>(p.r * PM7_A0)
+        })
+        .sum()
 }
 
 /// Analytic Cartesian gradient of the H–H repulsion (kcal/mol per Bohr).
 pub fn hh_repulsion_gradient(molecule: &Molecule) -> Vec<Vec3> {
+    hh_repulsion_gradient_cut(molecule, f64::INFINITY).0
+}
+
+/// H–H repulsion gradient and virial with an explicit image cutoff.
+///
+/// A self-image pair contributes nothing to the gradient — both ends are the same atom, so the
+/// two contributions cancel — but it does contribute to the virial. That asymmetry is real:
+/// dropping it would leave a periodic stress silently short.
+pub fn hh_repulsion_gradient_cut(molecule: &Molecule, cutoff: f64) -> (Vec<Vec3>, Mat3) {
     let n = molecule.atoms.len();
     let mut grad = vec![Vec3::zero(); n];
-    for i in 0..n {
-        if molecule.atoms[i].z != 1 {
+    let mut virial = Mat3::zero();
+    let list = crate::pbc::PairList::cached(molecule, cutoff);
+    let r_on = crate::pbc::taper_onset(cutoff);
+    for p in &list.pairs {
+        if molecule.atoms[p.a].z != 1 || molecule.atoms[p.b].z != 1 {
             continue;
         }
-        for j in 0..i {
-            if molecule.atoms[j].z != 1 {
-                continue;
-            }
-            let d = molecule.atoms[i].position - molecule.atoms[j].position;
-            let r_bohr = d.norm();
-            // dE/dr_ang via a 1-D dual on the Å distance; chain to Bohr via PM7_A0.
-            let e = poly_scalar::<Dual>(Dual::var(r_bohr * PM7_A0, 0));
-            let dedr_ang = e.d[0];
-            let dedr_bohr = dedr_ang * PM7_A0;
-            let unit = d / r_bohr;
-            grad[i] += unit * dedr_bohr;
-            grad[j] -= unit * dedr_bohr;
-        }
+        // dE/dr_ang via a 1-D dual on the Å distance; chain to Bohr via PM7_A0.
+        let e = poly_scalar::<Dual>(Dual::var(p.r * PM7_A0, 0));
+        // Product rule through the taper (in Bohr): d(w·e)/dr = w' e + w · (de/dr).
+        let (w, dw) = crate::pbc::taper(p.r, r_on, cutoff);
+        let dedr = dw * e.v + w * e.d[0] * PM7_A0;
+        let dedd = p.d / p.r * (p.weight * dedr);
+        grad[p.a] -= dedd;
+        grad[p.b] += dedd;
+        virial = virial.plus(&Mat3::outer(dedd, p.d));
     }
-    grad
+    (grad, virial)
 }
 
 #[cfg(test)]

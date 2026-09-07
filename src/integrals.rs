@@ -63,7 +63,13 @@ const XX_MONOPOLE: [usize; 10] = [0, 2, 3, 10, 11, 15, 16, 17, 18, 20];
 const XH_MONOPOLE: [usize; 3] = [0, 2, 3];
 
 /// Rotation matrix (rows) that rotates the unit vector `v` onto +x (`R·v = (1,0,0)`),
-/// generic over the scalar type. Port of PySEQM `rotate_with_quaternion`.
+/// generic over the scalar type.
+///
+/// The shortest-arc quaternion `q = (1 + v·x̂, v × x̂)`, normalized — the standard construction,
+/// chosen over MOPAC's direction cosines (`src/integrals/rotate.F90`) because it is smooth in `v`
+/// and therefore differentiable by the `Scalar` dual types, which the direction-cosine form is
+/// not. Only the exact antipode is singular, and `rotfix` routes a window around it to finite
+/// differences.
 pub fn rotation_to_x_g<S: Scalar>(vx: S, vy: S, vz: S) -> [[S; 3]; 3] {
     let mut qx = S::cst(0.0);
     let mut qy = vz;
@@ -105,20 +111,64 @@ pub fn rotation_to_x(v: Vec3) -> [[f64; 3]; 3] {
 
 /// Rotated two-electron integrals + electron–core attractions for one ordered atom pair,
 /// generic over the scalar type.
+///
+/// `w` is a **flat, row-major** `npair_i × npair_j` block. A `Vec<Vec<S>>` costs one allocation
+/// per bra pair (45 of them for a d–d pair) and a pointer chase on every read; the Fock build
+/// reads this array `n_a² · n_b²` times per atom pair per SCF iteration, so the indirection was
+/// measurable. Index it through [`PairTwoElecG::two_e`] / [`PairTwoElecG::at`] rather than
+/// touching the field directly.
 pub struct PairTwoElecG<S: Scalar> {
     pub norb_i: usize,
     pub norb_j: usize,
-    /// `w[pack_i(a,b)][pack_j(c,d)] = (a_i b_i | c_j d_j)` (eV).
-    pub w: Vec<Vec<S>>,
+    /// Number of packed orbital pairs on atom i (1, 10, or 45).
+    pub npair_i: usize,
+    /// Number of packed orbital pairs on atom j (1, 10, or 45).
+    pub npair_j: usize,
+    /// `w[pack_i(a,b) * npair_j + pack_j(c,d)] = (a_i b_i | c_j d_j)` (eV).
+    pub w: Vec<S>,
     /// Electron–core attraction blocks, up to 9×9 for spd atoms (sp fills 4×4).
     pub e1b: [[S; 9]; 9],
     pub e2a: [[S; 9]; 9],
 }
 
 impl<S: Scalar> PairTwoElecG<S> {
+    /// Allocate a zeroed `npair_i × npair_j` block.
+    pub fn zeros(norb_i: usize, norb_j: usize, npair_i: usize, npair_j: usize) -> Self {
+        Self {
+            norb_i,
+            norb_j,
+            npair_i,
+            npair_j,
+            w: vec![S::cst(0.0); npair_i * npair_j],
+            e1b: [[S::cst(0.0); 9]; 9],
+            e2a: [[S::cst(0.0); 9]; 9],
+        }
+    }
+
     #[inline]
     pub fn two_e(&self, a: usize, b: usize, c: usize, d: usize) -> S {
-        self.w[pack(a, b)][pack(c, d)]
+        self.w[pack(a, b) * self.npair_j + pack(c, d)]
+    }
+
+    /// Read the packed-pair element `(pi, pj)` directly.
+    #[inline]
+    pub fn at(&self, pi: usize, pj: usize) -> S {
+        self.w[pi * self.npair_j + pj]
+    }
+
+    /// Mutable access to the packed-pair element `(pi, pj)`.
+    #[inline]
+    pub fn at_mut(&mut self, pi: usize, pj: usize) -> &mut S {
+        let stride = self.npair_j;
+        &mut self.w[pi * stride + pj]
+    }
+
+    /// One row of the block: all ket pairs for bra pair `pi`. Contiguous, so the Fock
+    /// contraction over the ket index vectorizes.
+    #[inline]
+    pub fn row(&self, pi: usize) -> &[S] {
+        let stride = self.npair_j;
+        &self.w[pi * stride..pi * stride + stride]
     }
 }
 
@@ -151,7 +201,9 @@ pub fn pair_two_electron_g<S: Scalar>(
     let mut e1b = [[S::cst(0.0); 9]; 9];
     let mut e2a = [[S::cst(0.0); 9]; 9];
 
-    // Two-electron frame uses v = -xij (PySEQM convention).
+    // The two-electron frame points along -xij, not +xij. A frame convention, not a derivation:
+    // it fixes the sign of the local multipole axes, and `tests/element_pairs.rs` pins the
+    // resulting integrals against MOPAC, which is what says this choice is the right one.
     let rot = rotation_to_x_g(-xij[0], -xij[1], -xij[2]);
     let r0 = rot[0];
     let r1 = rot[1];
@@ -167,7 +219,9 @@ pub fn pair_two_electron_g<S: Scalar>(
         return PairTwoElecG {
             norb_i: 1,
             norb_j: 1,
-            w: vec![vec![ee]],
+            npair_i: 1,
+            npair_j: 1,
+            w: vec![ee],
             e1b,
             e2a,
         };
@@ -177,10 +231,8 @@ pub fn pair_two_electron_g<S: Scalar>(
         let ri = local_xh_g(ei, ej, r);
         let mut wxh = [S::cst(0.0); 10];
         build_wxh_g(&ri, &r0, &r1, &r2, &mut wxh);
-        let mut w = vec![vec![S::cst(0.0)]; 10];
-        for (p, wv) in wxh.iter().enumerate() {
-            w[p][0] = *wv;
-        }
+        // 10 bra pairs × 1 ket pair: the flat block is just the wxh column.
+        let w = wxh.to_vec();
         for a in 0..4 {
             for b in 0..4 {
                 e1b[a][b] = wxh[pack(a, b)] * (-ej.core_charge);
@@ -190,6 +242,8 @@ pub fn pair_two_electron_g<S: Scalar>(
         return PairTwoElecG {
             norb_i: 4,
             norb_j: 1,
+            npair_i: 10,
+            npair_j: 1,
             w,
             e1b,
             e2a,
@@ -197,22 +251,19 @@ pub fn pair_two_electron_g<S: Scalar>(
     }
 
     let ri = local_xx_g(ei, ej, r);
-    let w100 = rotate_xx_g(&ri, &r0, &r1, &r2);
-    let mut w = vec![vec![S::cst(0.0); 10]; 10];
-    for a in 0..10 {
-        for b in 0..10 {
-            w[a][b] = w100[a * 10 + b];
-        }
-    }
+    // `rotate_xx_g` already returns the 10×10 block in flat row-major order.
+    let w = rotate_xx_g(&ri, &r0, &r1, &r2).to_vec();
     for a in 0..4 {
         for b in 0..4 {
-            e1b[a][b] = w[pack(a, b)][0] * (-ej.core_charge);
-            e2a[a][b] = w[0][pack(a, b)] * (-ei.core_charge);
+            e1b[a][b] = w[pack(a, b) * 10] * (-ej.core_charge);
+            e2a[a][b] = w[pack(a, b)] * (-ei.core_charge);
         }
     }
     PairTwoElecG {
         norb_i: 4,
         norb_j: 4,
+        npair_i: 10,
+        npair_j: 10,
         w,
         e1b,
         e2a,
@@ -486,6 +537,99 @@ fn rotate_xx_g<S: Scalar>(ri: &[S; 22], r0: &[S; 3], r1: &[S; 3], r2: &[S; 3]) -
     w
 }
 
+/// The exact two-centre block for a pair separated by more than the 7 Å feather range, built
+/// directly instead of evaluated.
+///
+/// Beyond that range PM7's feathering has driven every higher multipole to zero and every
+/// monopole to the bare point charge, so the block is fully determined by `r`:
+///
+/// ```text
+/// (μ_i ν_i | λ_j σ_j) = δ_μν δ_λσ · v,      v = PM7_EV / r
+/// e1b[μν] = −δ_μν Z_j v,   e2a[λσ] = −δ_λσ Z_i v
+/// ```
+///
+/// The monopole moment of the charge distribution `μν` is `δ_μν` in an orthonormal basis and is
+/// rotation-invariant, so no local frame or rotation is involved — which is what makes this both
+/// exact and O(1). A periodic system spends most of its pair list out here, so building the
+/// block rather than evaluating the full NDDO kernel is the difference between a cheap long
+/// exchange tail and an unaffordable one.
+pub fn point_charge_pair(ei: &Pm7Element, ej: &Pm7Element, r: f64) -> PairTwoElec {
+    let v = PM7_EV / r;
+    let (ni, nj) = (ei.n_orb.max(1), ej.n_orb.max(1));
+    let npair_i = ni * (ni + 1) / 2;
+    let npair_j = nj * (nj + 1) / 2;
+    let mut out = PairTwoElecG::<f64>::zeros(ei.n_orb, ej.n_orb, npair_i, npair_j);
+    for a in 0..ni {
+        for c in 0..nj {
+            *out.at_mut(pack(a, a), pack(c, c)) = v;
+        }
+    }
+    for a in 0..ni {
+        out.e1b[a][a] = -ej.core_charge * v;
+    }
+    for c in 0..nj {
+        out.e2a[c][c] = -ei.core_charge * v;
+    }
+    out
+}
+
+/// [`point_charge_pair`] with exact first derivatives with respect to the displacement.
+///
+/// `d(1/r)/d**d** = −**d**/r³`, so the whole block's derivative is one scalar times the
+/// displacement — no rotation frame, and no risk of the frame-singularity fallback that the
+/// full kernel needs.
+pub fn point_charge_pair_dual(ei: &Pm7Element, ej: &Pm7Element, d: Vec3) -> PairTwoElecG<Dual> {
+    let r = d.norm();
+    let v = PM7_EV / r;
+    let dv = -PM7_EV / (r * r * r);
+    let value = Dual {
+        v,
+        d: [d.x * dv, d.y * dv, d.z * dv],
+    };
+    point_charge_block(ei, ej, value)
+}
+
+/// [`point_charge_pair`] with exact first *and second* derivatives, for the periodic Hessian.
+///
+/// Seeding the displacement as `Dual2` variables and evaluating `PM7_EV/|d|` symbolically keeps
+/// this consistent with the first-derivative form by construction: the same expression, one
+/// derivative order higher.
+pub fn point_charge_pair_dual2(
+    ei: &Pm7Element,
+    ej: &Pm7Element,
+    d: Vec3,
+) -> PairTwoElecG<crate::dual2::Dual2> {
+    use crate::dual::Scalar;
+    use crate::dual2::Dual2;
+    let dv = [Dual2::var(d.x, 0), Dual2::var(d.y, 1), Dual2::var(d.z, 2)];
+    let r = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt();
+    point_charge_block(ei, ej, r.recip() * PM7_EV)
+}
+
+/// Fill a pair block whose every monopole entry is the same value `v = PM7_EV/r`.
+fn point_charge_block<S: crate::dual::Scalar>(
+    ei: &Pm7Element,
+    ej: &Pm7Element,
+    value: S,
+) -> PairTwoElecG<S> {
+    let (ni, nj) = (ei.n_orb.max(1), ej.n_orb.max(1));
+    let npair_i = ni * (ni + 1) / 2;
+    let npair_j = nj * (nj + 1) / 2;
+    let mut out = PairTwoElecG::<S>::zeros(ei.n_orb, ej.n_orb, npair_i, npair_j);
+    for a in 0..ni {
+        for c in 0..nj {
+            *out.at_mut(pack(a, a), pack(c, c)) = value;
+        }
+    }
+    for a in 0..ni {
+        out.e1b[a][a] = value * (-ej.core_charge);
+    }
+    for c in 0..nj {
+        out.e2a[c][c] = value * (-ei.core_charge);
+    }
+    out
+}
+
 /// Dual-valued two-electron integrals for a pair, seeded on the displacement `R_j − R_i`.
 pub fn pair_two_electron_dual(ei: &Pm7Element, ej: &Pm7Element, dvec: Vec3) -> PairTwoElecG<Dual> {
     pair_two_electron_g(
@@ -523,12 +667,12 @@ mod tests {
         let r = 2.6;
         let a = pair_two_electron(c, c, Vec3::new(1.0, 0.0, 0.0), r);
         let b = pair_two_electron(c, c, Vec3::new(0.3, -0.5, 0.8).normalized(), r);
-        assert!((a.w[0][0] - b.w[0][0]).abs() < 1e-9);
+        assert!((a.at(0, 0) - b.at(0, 0)).abs() < 1e-9);
         // The (ss|ss) integral is feathered toward the point charge (PM7 `l_feather`).
         let nddo = PM7_EV / (r * r + (2.0 * c.rho0).powi(2)).sqrt();
         let (cfrac, point) = feather_to_point(r);
         let expect = nddo * cfrac + point * (1.0 - cfrac);
-        assert!((a.w[0][0] - expect).abs() < 1e-9);
+        assert!((a.at(0, 0) - expect).abs() < 1e-9);
     }
 
     #[test]
@@ -561,8 +705,8 @@ mod tests {
             let wm = pair_two_electron_g::<f64>(c, o, [dm.x, dm.y, dm.z]);
             for a in 0..10 {
                 for b in 0..10 {
-                    let fd = (wp.w[a][b] - wm.w[a][b]) / (2.0 * h);
-                    max_delta = max_delta.max((dual.w[a][b].d[axis] - fd).abs());
+                    let fd = (wp.at(a, b) - wm.at(a, b)) / (2.0 * h);
+                    max_delta = max_delta.max((dual.at(a, b).d[axis] - fd).abs());
                 }
             }
         }
